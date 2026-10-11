@@ -81,10 +81,10 @@ def main():
         path.write_text(content)
         path.chmod(0o600)
     if os.geteuid() == 0:
-        output.chown(uid, gid)
+        os.chown(output, uid, gid)
         for path in output.iterdir():
             if path.is_file():
-                path.chown(uid, gid)
+                os.chown(path, uid, gid)
 
 
 if __name__ == "__main__":

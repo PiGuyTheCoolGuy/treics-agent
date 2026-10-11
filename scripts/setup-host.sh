@@ -10,8 +10,30 @@ if [[ ! -c /dev/kvm ]]; then
     echo 'KVM is unavailable. Enable Intel VT-x in BIOS and check ls -l /dev/kvm.' >&2
     exit 1
 fi
-if ! command -v ollama >/dev/null; then
-    curl -fsSL https://ollama.com/install.sh | sh
+if ! command -v ollama >/dev/null || ! ollama --version >/dev/null 2>&1 || ! sudo systemctl cat ollama.service >/dev/null 2>&1; then
+    # A failed extraction can leave a binary without a working installation.
+    # Retry the whole installer, so each archive extraction starts fresh.
+    treic_installer="$(mktemp)"
+    trap 'rm -f "$treic_installer"' EXIT
+    curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+        https://ollama.com/install.sh -o "$treic_installer"
+    treic_installed=false
+    for treic_attempt in 1 2 3; do
+        if sh "$treic_installer"; then
+            treic_installed=true
+            break
+        fi
+        if [[ "$treic_attempt" -lt 3 ]]; then
+            echo "Ollama installation interrupted; retrying ($treic_attempt/3)..." >&2
+            sleep 5
+        fi
+    done
+    rm -f "$treic_installer"
+    trap - EXIT
+    if [[ "$treic_installed" != true ]]; then
+        echo 'Ollama installation failed after 3 attempts. Rerun this script to try again.' >&2
+        exit 1
+    fi
 fi
 sudo systemctl enable --now ollama libvirtd
 sudo install -d -m 755 /opt/treics-agent-host /etc/treics-agent /etc/libvirt/hooks/network.d /etc/libvirt/hooks/qemu.d

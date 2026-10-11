@@ -1,0 +1,28 @@
+# Copy to ~/.config/treics-agent/config.toml; do not commit your real tokens.
+ollama_url = "http://192.168.152.1:11435"
+ollama_token = "REPLACE_WITH_HOST_MODEL_PROXY_TOKEN"
+model = "qwen3-vl:30b-a3b-instruct"
+# 16 physical cores is a starting point on the dual E5-2660 v2; benchmark 12/16/20.
+num_thread = 16
+num_ctx = 8192
+num_predict = 1600
+keep_alive = "30m"
+request_timeout = 1200
+
+display = ":99"
+xauthority = "~/.Xauthority"
+screen_width = 1024
+screen_height = 768
+work_dir = "~/agent-workspace"
+data_dir = "~/.local/share/treics-agent"
+max_steps = 100
+max_run_minutes = 240
+shell_timeout = 120
+history_steps = 6
+browser = "firefox"
+
+# The automated VM installer uses 0.0.0.0 inside the NAT guest, with authentication.
+# A manual installation defaults to guest loopback and can use an SSH tunnel.
+bind = "127.0.0.1"
+port = 8010
+dashboard_token = "REPLACE_WITH_A_RANDOM_TOKEN_AT_LEAST_24_CHARACTERS"

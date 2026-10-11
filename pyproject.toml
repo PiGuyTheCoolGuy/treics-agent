@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "treics-agent"
+version = "0.1.0"
+description = "A local Qwen desktop agent for an isolated Linux VM"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.4,<13"]
+
+[project.scripts]
+treics-agent = "treics_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["treics_agent*"]
+
+[tool.setuptools.package-data]
+treics_agent = ["static/*.html"]

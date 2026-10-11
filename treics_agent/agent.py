@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import copy
+import json
+import threading
+import time
+
+from .config import Config
+from .model import Cancelled, ModelClient, ModelError
+from .storage import Store
+from .tools import ToolError, Tools
+
+
+TERMINAL_STATES = {"completed", "failed", "stopped", "limit_reached", "interrupted"}
+
+
+class Agent:
+    def __init__(self, config: Config, store: Store, tools: Tools | None = None,
+                 model: ModelClient | None = None):
+        self.config = config
+        self.store = store
+        self.tools = tools or Tools(config, store)
+        self.model = model or ModelClient(config)
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.stop_event = threading.Event()
+        self.paused = False
+        self.thread: threading.Thread | None = None
+        self.current: str | None = None
+        self.phase = "idle"
+        self.last_model_seconds: float | None = None
+        self.phase_started = time.time()
+        self.store.recover()
+
+    def set_phase(self, phase: str) -> None:
+        with self.lock:
+            self.phase = phase
+            self.phase_started = time.time()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"current": self.store.run(self.current) if self.current else None,
+                    "phase": self.phase, "phase_started": self.phase_started,
+                    "last_model_seconds": self.last_model_seconds,
+                    "model": self.config.model, "ollama_url": self.config.ollama_url,
+                    "workspace": str(self.config.work_path), "runs": self.store.runs()}
+
+    def start(self, task: str, max_steps: int | None = None) -> str:
+        if not isinstance(task, str) or not task.strip() or len(task) > 12000:
+            raise ValueError("Task must contain 1–12000 characters.")
+        max_steps = self.config.max_steps if max_steps is None else max_steps
+        if type(max_steps) is not int or not 1 <= max_steps <= 10000:
+            raise ValueError("max_steps must be an integer from 1 to 10000.")
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise ValueError("A task is already active. Stop it before starting another.")
+            self.stop_event.clear()
+            self.paused = False
+            self.current = self.store.create_run(task.strip(), max_steps, self.config.model)
+            self.tools.desktop.run_directory = self.config.data_path / "runs" / self.current
+            self.set_phase("starting")
+            self.thread = threading.Thread(target=self._run, args=(self.current,), daemon=True,
+                                           name="treic-agent-run")
+            self.thread.start()
+            return self.current
+
+    def pause(self) -> None:
+        with self.condition:
+            if not self.thread or not self.thread.is_alive() or self.stop_event.is_set():
+                raise ValueError("No running task to pause.")
+            self.paused = True
+            self.store.update(self.current, status="pausing")
+            self.condition.notify_all()
+
+    def resume(self) -> None:
+        with self.condition:
+            if not self.paused or not self.thread or not self.thread.is_alive() or self.stop_event.is_set():
+                raise ValueError("No paused task to resume.")
+            self.paused = False
+            self.store.update(self.current, status="running")
+            self.condition.notify_all()
+
+    def stop(self) -> None:
+        with self.condition:
+            if not self.thread or not self.thread.is_alive():
+                return
+            self.stop_event.set()
+            self.store.update(self.current, status="stopping")
+            self.condition.notify_all()
+        self.model.cancel()
+        self.tools.cancel()
+
+    def _gate(self, deadline: float) -> None:
+        with self.condition:
+            while self.paused and not self.stop_event.is_set():
+                self.store.update(self.current, status="paused")
+                self.set_phase("paused")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Run time limit reached while paused.")
+                self.condition.wait(timeout=0.5)
+            if self.stop_event.is_set():
+                raise Cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Run time limit reached.")
+
+    def _context_events(self, run_id: str) -> list[dict]:
+        events = [e for e in self.store.events(run_id, self.config.history_steps * 3)
+                  if e['kind'] != 'action_started'][-self.config.history_steps:]
+        events = copy.deepcopy(events)
+        for event in events:
+            # Keep logs complete on disk, but avoid re-sending giant scripts/output every step.
+            data = event["data"]
+            if "decision" in data:
+                args = data["decision"].get("arguments", {})
+                for key, value in args.items():
+                    if isinstance(value, str) and len(value) > 1600:
+                        args[key] = value[:1600] + "\n[context truncated; full action is in the run log]"
+            if "result" in data:
+                encoded = json.dumps(data["result"], ensure_ascii=False)
+                if len(encoded) > 3500:
+                    data["result"] = {"ok": data["result"].get("ok"),
+                                      "excerpt": encoded[:3500], "context_truncated": True}
+        return events
+
+    def _run(self, run_id: str) -> None:
+        run = self.store.run(run_id)
+        deadline = time.monotonic() + self.config.max_run_minutes * 60
+        errors = 0
+        screen = None
+        try:
+            self._gate(deadline)
+            self.set_phase("observing")
+            screen = self.tools.desktop.capture()
+            for step in range(1, run["max_steps"] + 1):
+                self._gate(deadline)
+                self.store.update(run_id, step=step)
+                self.set_phase("model")
+                started = time.monotonic()
+                try:
+                    decision, metrics = self.model.decide(
+                        run["task"], self.store.run(run_id)["state"], self.store.memory(),
+                        self._context_events(run_id), screen, self.stop_event)
+                    with self.lock:
+                        self.last_model_seconds = time.monotonic() - started
+                    # A pause/stop that arrived during inference must gate the proposed action.
+                    self._gate(deadline)
+                    self.store.update(run_id, state=decision["state"])
+                    self.set_phase("action")
+                    self.store.event(run_id, step, "action_started", {"decision": decision})
+                    result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
+                    self.store.event(run_id, step, "action", {"decision": decision, "result": result,
+                                                             "model_seconds": self.last_model_seconds,
+                                                             "metrics": metrics})
+                    errors = 0 if result.get("ok", False) else errors + 1
+                    if decision["action"] == "finish":
+                        self.store.update(run_id, status="completed", summary=result["summary"])
+                        return
+                    if decision["action"] in self.tools.GUI_ACTIONS:
+                        self._gate(deadline)
+                        self.set_phase("observing")
+                        screen = self.tools.desktop.capture()
+                    else:
+                        screen = None
+                        # A file/terminal tool can change the GUI; don't accept stale coordinates.
+                        self.tools.desktop.frame = None
+                except (ModelError, ToolError, OSError, ValueError) as exc:
+                    if self.stop_event.is_set():
+                        raise Cancelled() from exc
+                    errors += 1
+                    self.store.event(run_id, step, "error", {"message": str(exc)[:2000]})
+                    if isinstance(exc, (ToolError, OSError)):
+                        screen = None
+                        self.tools.desktop.frame = None
+                    if self.stop_event.wait(min(errors * 2, 10)):
+                        raise Cancelled()
+                if errors >= 5:
+                    raise RuntimeError("Stopped after five consecutive model/tool failures; inspect the run log.")
+            self.store.update(run_id, status="limit_reached", summary="Step limit reached. Inspect the log and start a follow-up task.")
+        except Cancelled:
+            self.store.update(run_id, status="stopped", summary="Stopped by user. No further actions will execute.")
+        except TimeoutError as exc:
+            self.store.update(run_id, status="limit_reached", summary=str(exc))
+        except Exception as exc:
+            if self.stop_event.is_set():
+                self.store.update(run_id, status="stopped", summary="Stopped by user. No further actions will execute.")
+            else:
+                self.store.event(run_id, self.store.run(run_id)["step"], "error", {"message": str(exc)[:2000]})
+                self.store.update(run_id, status="failed", summary=str(exc)[:2000])
+        finally:
+            self.set_phase("idle")
+
+    def shutdown(self) -> None:
+        self.stop()
+        if self.thread:
+            self.thread.join(timeout=15)

@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+import base64
+import io
+import os
+import re
+import selectors
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from .config import Config
+from .model import Cancelled
+from .storage import Store
+
+
+class ToolError(Exception):
+    pass
+
+
+def number(value, name: str, low: float, high: float, integer: bool = False):
+    if type(value) not in (int, float) or not low <= value <= high or (integer and type(value) is not int):
+        raise ToolError(f"{name} must be {'an integer' if integer else 'a number'} between {low} and {high}.")
+    return value
+
+
+def text(value, name: str, maximum: int = 100000) -> str:
+    if not isinstance(value, str) or len(value) > maximum or "\0" in value:
+        raise ToolError(f"{name} must be text of at most {maximum} characters without NUL bytes.")
+    return value
+
+
+class Desktop:
+    def __init__(self, config: Config):
+        self.config = config
+        self.lock = threading.RLock()
+        self.frame: dict | None = None
+        self.image: bytes | None = None
+        self.run_directory: Path | None = None
+
+    def command(self, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(args, env=self.config.desktop_env(), check=True,
+                                  timeout=15, capture_output=True, **kwargs)
+        except FileNotFoundError as exc:
+            raise ToolError(f"Missing desktop command: {args[0]}. Run scripts/install-guest.sh.") from exc
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or b"").decode(errors="replace")[:500]
+            raise ToolError(f"{args[0]} failed: {message}. Check the X11 desktop service and DISPLAY.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ToolError(f"Desktop command {args[0]} timed out.") from exc
+
+    def capture(self) -> dict:
+        from PIL import Image
+
+        with self.lock, tempfile.TemporaryDirectory(prefix="treic-screen-") as directory:
+            path = Path(directory) / "screen.png"
+            self.command(["scrot", "-o", str(path)])
+            with Image.open(path) as original:
+                screen_width, screen_height = original.size
+                image = original.convert("RGB")
+                image.thumbnail((self.config.screen_width, self.config.screen_height), Image.Resampling.LANCZOS)
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=85)
+                self.image = output.getvalue()
+                self.frame = {"width": image.width, "height": image.height,
+                              "desktop_width": screen_width, "desktop_height": screen_height,
+                              "captured_at": time.time(), "base64": base64.b64encode(self.image).decode()}
+            if self.run_directory:
+                self.run_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                temporary = self.run_directory / "screen.tmp"
+                temporary.write_bytes(self.image)
+                temporary.replace(self.run_directory / "screen.jpg")
+            return dict(self.frame)
+
+    def coordinates(self, x, y) -> tuple[int, int]:
+        if not self.frame:
+            raise ToolError("No current screenshot. Use screenshot before a coordinate action.")
+        frame = self.frame
+        x = number(x, "x", 0, frame["width"] - 1, integer=True)
+        y = number(y, "y", 0, frame["height"] - 1, integer=True)
+        return (min(frame["desktop_width"] - 1, round(x * frame["desktop_width"] / frame["width"])),
+                min(frame["desktop_height"] - 1, round(y * frame["desktop_height"] / frame["height"])))
+
+    def key(self, keys: list[str]) -> None:
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 6:
+            raise ToolError("keys must be a list of 1–6 X11 key names.")
+        if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_]+", k) for k in keys):
+            raise ToolError("Invalid X11 key name.")
+        aliases = {"enter": "Return", "esc": "Escape", "escape": "Escape", "backspace": "BackSpace",
+                   "space": "space", "tab": "Tab", "delete": "Delete", "control": "ctrl",
+                   "super": "super", "shift": "shift", "alt": "alt"}
+        self.command(["xdotool", "key", "--clearmodifiers", "+".join(aliases.get(k.lower(), k) for k in keys)])
+
+
+class Tools:
+    GUI_ACTIONS = {"screenshot", "click", "move", "drag", "scroll", "type", "press", "hotkey",
+                   "open_browser", "wait"}
+    ARGS = {
+        "screenshot": (set(), set()), "click": ({"x", "y"}, {"button", "clicks"}),
+        "move": ({"x", "y"}, set()), "drag": ({"x", "y", "end_x", "end_y"}, {"duration"}),
+        "scroll": ({"amount"}, {"x", "y"}), "type": ({"text"}, {"paste_keys"}),
+        "press": ({"key"}, set()), "hotkey": ({"keys"}, set()),
+        "shell": ({"command"}, {"cwd", "timeout"}), "read_file": ({"path"}, {"offset", "limit"}),
+        "write_file": ({"path", "content"}, set()), "list_files": (set(), {"path"}),
+        "open_browser": ({"url"}, set()), "wait": ({"seconds"}, set()),
+        "remember": ({"text"}, set()), "finish": ({"summary"}, set()),
+    }
+
+    def __init__(self, config: Config, store: Store, desktop: Desktop | None = None):
+        self.config = config
+        self.store = store
+        self.desktop = desktop or Desktop(config)
+        self.config.work_path.mkdir(parents=True, exist_ok=True)
+        self.process_lock = threading.Lock()
+        self.process: subprocess.Popen | None = None
+
+    @staticmethod
+    def kill(process: subprocess.Popen) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def cancel(self) -> None:
+        with self.process_lock:
+            if self.process:
+                self.kill(self.process)
+
+    def resolve(self, value) -> Path:
+        path = Path(text(value, "path", 4096)).expanduser()
+        return path if path.is_absolute() else self.config.work_path / path
+
+    def shell(self, arguments: dict, stop: threading.Event) -> dict:
+        command = text(arguments["command"], "command", 32000)
+        cwd = self.resolve(arguments.get("cwd", str(self.config.work_path)))
+        timeout = number(arguments.get("timeout", self.config.shell_timeout), "timeout", 1, 600, True)
+        if not cwd.is_dir():
+            raise ToolError(f"Working directory does not exist: {cwd}")
+        if stop.is_set():
+            raise Cancelled()
+        process = subprocess.Popen(["/bin/bash", "-lc", command], cwd=cwd, env=self.config.desktop_env(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        with self.process_lock:
+            self.process = process
+        deadline = time.monotonic() + timeout
+        output = bytearray()
+        truncated = timed_out = False
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    if stop.is_set():
+                        self.kill(process)
+                        raise Cancelled()
+                    if time.monotonic() > deadline:
+                        timed_out = True
+                        self.kill(process)
+                        break
+                    for key, _ in selector.select(0.1):
+                        chunk = os.read(key.fileobj.fileno(), 8192)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        available = max(0, 48000 - len(output))
+                        output.extend(chunk[:available])
+                        truncated |= len(chunk) > available
+                process.wait(timeout=5)
+            if stop.is_set():
+                raise Cancelled()
+            return {"ok": process.returncode == 0 and not timed_out,
+                    "exit_code": process.returncode, "timed_out": timed_out,
+                    "output": output.decode(errors="replace"), "truncated": truncated, "cwd": str(cwd)}
+        finally:
+            if process.poll() is None:
+                self.kill(process)
+            process.wait(timeout=5)
+            if process.stdout:
+                process.stdout.close()
+            with self.process_lock:
+                if self.process is process:
+                    self.process = None
+
+    def execute(self, action: str, arguments: dict, stop: threading.Event) -> dict:
+        if stop.is_set():
+            raise Cancelled()
+        if action not in self.ARGS or not isinstance(arguments, dict):
+            raise ToolError("Unknown tool or invalid arguments.")
+        required, optional = self.ARGS[action]
+        if missing := required - arguments.keys():
+            raise ToolError("Missing arguments: " + ", ".join(sorted(missing)))
+        if extra := arguments.keys() - required - optional:
+            raise ToolError("Unexpected arguments: " + ", ".join(sorted(extra)))
+        a = arguments
+        d = self.desktop
+        if action == "shell":
+            return self.shell(a, stop)
+        if action == "read_file":
+            path = self.resolve(a["path"])
+            offset = number(a.get("offset", 0), "offset", 0, 10000000, True)
+            limit = number(a.get("limit", 12000), "limit", 1, 48000, True)
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                # Read a bounded prefix rather than loading an arbitrarily large file.
+                handle.read(offset)
+                content = handle.read(limit + 1)
+            return {"ok": True, "path": str(path), "offset": offset,
+                    "content": content[:limit], "truncated": len(content) > limit}
+        if action == "write_file":
+            path = self.resolve(a["path"])
+            content = text(a["content"], "content")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return {"ok": True, "path": str(path), "characters": len(content)}
+        if action == "list_files":
+            path = self.resolve(a.get("path", "."))
+            entries = []
+            with os.scandir(path) as iterator:
+                for entry in iterator:
+                    entries.append({"name": entry.name, "directory": entry.is_dir(follow_symlinks=False)})
+                    if len(entries) == 400:
+                        break
+            return {"ok": True, "path": str(path), "entries": entries, "limit": 400}
+        if action == "remember":
+            self.store.remember(text(a["text"], "text", 6000))
+            return {"ok": True, "message": "Persistent notes updated."}
+        if action == "finish":
+            return {"ok": True, "summary": text(a["summary"], "summary", 12000)}
+        with d.lock:
+            if action in ("click", "move", "drag"):
+                x, y = d.coordinates(a["x"], a["y"])
+                d.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
+                if action == "click":
+                    button = a.get("button", "left")
+                    if button not in ("left", "right", "middle"):
+                        raise ToolError("button must be left, right or middle.")
+                    clicks = number(a.get("clicks", 1), "clicks", 1, 2, True)
+                    d.command(["xdotool", "click", "--repeat", str(clicks), "--delay", "100",
+                               str({"left": 1, "middle": 2, "right": 3}[button])])
+                elif action == "drag":
+                    end_x, end_y = d.coordinates(a["end_x"], a["end_y"])
+                    duration = number(a.get("duration", 0.6), "duration", 0.1, 5)
+                    d.command(["xdotool", "mousedown", "1"])
+                    try:
+                        if stop.wait(duration / 2):
+                            raise Cancelled()
+                        d.command(["xdotool", "mousemove", "--sync", str(end_x), str(end_y)])
+                        if stop.wait(duration / 2):
+                            raise Cancelled()
+                    finally:
+                        d.command(["xdotool", "mouseup", "1"])
+            elif action == "scroll":
+                amount = number(a["amount"], "amount", -30, 30, True)
+                if ("x" in a) != ("y" in a):
+                    raise ToolError("Provide both x and y, or neither.")
+                if "x" in a:
+                    x, y = d.coordinates(a["x"], a["y"])
+                    d.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
+                if amount:
+                    d.command(["xdotool", "click", "--repeat", str(abs(amount)), "--delay", "30",
+                               "4" if amount > 0 else "5"])
+            elif action == "type":
+                content = text(a["text"], "text", 32000)
+                keys = a.get("paste_keys", ["ctrl", "v"])
+                # xclip forks to keep serving the selection; do not capture its inherited pipes.
+                subprocess.run(["xclip", "-selection", "clipboard"], input=content.encode(),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env=self.config.desktop_env(), check=True, timeout=10)
+                d.key(keys)
+            elif action == "press":
+                d.key([a["key"]])
+            elif action == "hotkey":
+                d.key(a["keys"])
+            elif action == "open_browser":
+                url = text(a["url"], "url", 4096)
+                parsed = urlsplit(url)
+                if parsed.scheme not in ("https", "http") or not parsed.hostname:
+                    raise ToolError("Browser URLs must start with http:// or https://.")
+                browser = self.config.browser
+                subprocess.Popen([browser, url], env=self.config.desktop_env(),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            elif action == "wait":
+                if stop.wait(number(a["seconds"], "seconds", 0.1, 30)):
+                    raise Cancelled()
+            elif action != "screenshot":
+                raise ToolError("Unsupported action.")
+            if stop.wait(0.25):
+                raise Cancelled()
+            return {"ok": True, "message": f"{action} completed; screen will be captured."}

@@ -152,6 +152,20 @@ sudo systemctl daemon-reload
 sudo systemctl restart libvirtd
 sudo systemctl enable --now treic-agent-firewall.service
 if [[ "${1:-}" != '--skip-model-pull' ]]; then
-    ollama pull qwen3-vl:30b-a3b-instruct
+    treic_model_ready=false
+    for treic_attempt in {1..20}; do
+        if ollama pull qwen3-vl:30b-a3b-instruct; then
+            treic_model_ready=true
+            break
+        fi
+        if [[ "$treic_attempt" -lt 20 ]]; then
+            echo "Model pull failed; retrying in 10 seconds ($treic_attempt/20)." >&2
+            sleep 10
+        fi
+    done
+    if [[ "$treic_model_ready" != true ]]; then
+        echo 'Model pull failed after 20 attempts. Rerun create-vm.sh to try again.' >&2
+        exit 1
+    fi
 fi
 echo 'Host prepared. create-vm.sh starts the gateway after its bridge exists.'

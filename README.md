@@ -1,0 +1,80 @@
+# Treic's Agent
+
+A local desktop agent for the Dell R620: **Ollama runs the model on the host; the controller and all of its tools run inside a KVM VM.** Give it a task through the dashboard, watch its screenshots and action log, and pause or stop it when needed.
+
+The default model is **`qwen3-vl:30b-a3b-instruct`**, the quantized vision model we discussed. This is a working controller, not a claim that the model will complete every task reliably. It uses the model to choose actions, executes them, and returns actual results to the next model call.
+
+## What it can do
+
+- See the desktop, click, double-click, right-click, drag, scroll, paste Unicode text, and use keyboard shortcuts.
+- Open Firefox, run Bash commands, read/write files, install guest software with `sudo`, and verify its work.
+- Keep a working summary within a run and persistent notes between runs.
+- Save run history and tool results in SQLite, with the most recent screenshot saved per run.
+- Start, pause, resume, and stop a task through an authenticated dashboard on port **8010**.
+
+It acts as the guest's `agent` user, with passwordless sudo **inside the guest**. The model never receives a host SSH key or a host shell tool. The dedicated network permits public Internet access and the host model gateway, and blocks other host services, private networks, and IPv6. This is practical isolation for a desktop assistant; it is not a hardened malware-analysis lab.
+
+## Set it up on treicserver
+
+Run these commands **on the Ubuntu server**, as your normal `treic` user:
+
+```bash
+git clone https://github.com/PiGuyTheCoolGuy/treics-agent.git
+cd treics-agent
+bash scripts/create-vm.sh
+```
+
+The script installs KVM/libvirt, reuses or installs Ollama, downloads the model, and creates an **Ubuntu 24.04 VM with 8 GB RAM, 6 vCPU and a 60 GB disk**. It verifies the Ubuntu image checksum, configures its network, and installs the desktop and agent using cloud-init. BIOS virtualization must be enabled. Allow roughly **100 GB of free host disk space** for the VM's possible growth, model, download, and headroom.
+
+If the model is already downloaded, `bash scripts/create-vm.sh --skip-model-pull` skips that step. Existing VMs or disks named `treic-agent` are never overwritten by this script. See [the setup guide](docs/SETUP.md) for existing-VM installation, logs, updates, and desktop viewing.
+
+Once SSH is ready, verify the guest and get its dashboard token:
+
+```bash
+# If SSH says "Connection refused", give first boot a little longer and retry.
+bash scripts/ssh-vm.sh 'cloud-init status --wait'
+bash scripts/ssh-vm.sh '~/treics-agent/.venv/bin/treics-agent doctor --test-model'
+bash scripts/ssh-vm.sh '~/treics-agent/.venv/bin/treics-agent token'
+```
+
+The vision test actually sends a red image to your model and checks its structured response. It reports the elapsed time, including a model load if needed. The first call can take longer than later calls on your CPU.
+
+On **your laptop**, substitute your server's reachable IP or hostname:
+
+```bash
+ssh -N -L 8010:192.168.152.10:8010 treic@YOUR_SERVER_IP
+```
+
+Leave that connection open. Visit **[http://localhost:8010](http://localhost:8010)**, paste the token, and start a task. The port is forwarded over SSH; no Boingo port forwarding is required if you can already SSH to the server.
+
+Try this first:
+
+> Create `hello.txt` in your workspace containing “Hello Owen” and “你好”. Read it back to verify it. Open Firefox to https://example.com, inspect the screenshot, then finish with a summary.
+
+The desktop starts automatically even though nobody is logged into a physical display. The VM and both guest services start at boot. A controller restart marks an unfinished task interrupted; it does **not** silently resume actions.
+
+## Defaults for your CPU-only server
+
+| Setting | Default |
+| --- | --- |
+| Vision model | `qwen3-vl:30b-a3b-instruct` |
+| Ollama worker threads | 16, a starting point for your dual E5-2660 v2 |
+| Context window | 8,192 tokens |
+| Model request timeout | 20 minutes |
+| Model keep-alive | 30 minutes |
+| Desktop and maximum screenshot | 1024 × 768 |
+| Task budget | 100 steps, 4 hours |
+| Shell command timeout | 120 seconds; up to 600 per command |
+
+Only the latest screenshot is sent to the model. Terminal/file steps use text results and omit old images. The agent can request a new screenshot when it returns to GUI work. Actual latency needs to be measured on your server; this repository contains no R620 benchmark results. An 8B model is also supported if you want to compare it later.
+
+## Verification
+
+```bash
+# Python 3.11+ with Pillow installed; no model needed for these regression tests.
+python3 -m unittest discover -s tests -v
+```
+
+The regression suite exercises real shell/file operations, cancellation, pause/resume, persistence, HTTP authentication, the Ollama request format and image handling, the gateway's model/API limits, and disconnect cancellation using a local simulated Ollama endpoint. It does not test Qwen's task accuracy or boot a KVM guest. Run `doctor --test-model` and the example task after provisioning to verify the real desktop/model integration.
+
+More detail: [setup and troubleshooting](docs/SETUP.md) · [architecture and operation](docs/ARCHITECTURE.md).

@@ -97,7 +97,7 @@ network_hook = Path('/etc/libvirt/hooks/network.d/90-treic-agent-firewall')
 network_hook.write_text('''#!/bin/bash
 set -euo pipefail
 if [[ "$1" == 'treic-agent' && "$2" == 'started' ]]; then
-    /opt/treics-agent-host/firewall.sh
+    /bin/bash /opt/treics-agent-host/firewall.sh
 fi
 ''')
 network_hook.chmod(0o755)
@@ -105,7 +105,7 @@ qemu_hook = Path('/etc/libvirt/hooks/qemu.d/90-treic-agent-firewall')
 qemu_hook.write_text('''#!/bin/bash
 set -euo pipefail
 if [[ "$1" == 'treic-agent' && "$2" == 'prepare' ]]; then
-    /opt/treics-agent-host/firewall.sh
+    /bin/bash /opt/treics-agent-host/firewall.sh
 fi
 ''')
 qemu_hook.chmod(0o755)
@@ -116,7 +116,7 @@ PartOf=libvirtd.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/treics-agent-host/firewall.sh
+ExecStart=/bin/bash /opt/treics-agent-host/firewall.sh
 RemainAfterExit=yes
 
 [Install]

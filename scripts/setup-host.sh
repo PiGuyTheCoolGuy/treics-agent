@@ -5,35 +5,77 @@ treic_repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst cloud-image-utils \
-    curl git openssh-client python3 iptables
+    curl git openssh-client python3 iptables zstd
 if [[ ! -c /dev/kvm ]]; then
     echo 'KVM is unavailable. Enable Intel VT-x in BIOS and check ls -l /dev/kvm.' >&2
     exit 1
 fi
 if ! command -v ollama >/dev/null || ! ollama --version >/dev/null 2>&1 || ! sudo systemctl cat ollama.service >/dev/null 2>&1; then
-    # A failed extraction can leave a binary without a working installation.
-    # Retry the whole installer, so each archive extraction starts fresh.
-    treic_installer="$(mktemp)"
-    trap 'rm -f "$treic_installer"' EXIT
-    curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
-        https://ollama.com/install.sh -o "$treic_installer"
-    treic_installed=false
-    for treic_attempt in 1 2 3; do
-        if sh "$treic_installer"; then
-            treic_installed=true
-            break
-        fi
-        if [[ "$treic_attempt" -lt 3 ]]; then
-            echo "Ollama installation interrupted; retrying ($treic_attempt/3)..." >&2
-            sleep 5
-        fi
-    done
-    rm -f "$treic_installer"
-    trap - EXIT
-    if [[ "$treic_installed" != true ]]; then
-        echo 'Ollama installation failed after 3 attempts. Rerun this script to try again.' >&2
+    # Download a fixed release to disk; never pipe a partial download into tar.
+    treic_version="$(curl --fail --silent --show-error --location --retry 5 \
+        https://api.github.com/repos/ollama/ollama/releases/latest | \
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+    if [[ ! "$treic_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Unexpected Ollama release: $treic_version" >&2
         exit 1
     fi
+    treic_cache="${XDG_CACHE_HOME:-$HOME/.cache}/treics-agent"
+    mkdir -p "$treic_cache"
+    treic_archive="$treic_cache/ollama-linux-amd64-$treic_version.tar.zst"
+    treic_url="https://github.com/ollama/ollama/releases/download/$treic_version/ollama-linux-amd64.tar.zst"
+    treic_downloaded=false
+    for treic_attempt in {1..20}; do
+        if [[ -s "$treic_archive" ]] && tar --zstd -tf "$treic_archive" >/dev/null 2>&1; then
+            treic_downloaded=true
+            break
+        fi
+        echo "Downloading Ollama $treic_version (attempt $treic_attempt/20; resuming saved bytes)..."
+        if curl --http1.1 --fail --location --show-error --connect-timeout 30 \
+            --speed-limit 1024 --speed-time 120 --continue-at - \
+            --output "$treic_archive" "$treic_url"; then
+            if tar --zstd -tf "$treic_archive" >/dev/null 2>&1; then
+                treic_downloaded=true
+                break
+            fi
+            echo 'Downloaded archive is invalid; discarding it before retrying.' >&2
+            rm -f "$treic_archive"
+        else
+            treic_curl_status=$?
+            # A server that refuses ranges requires a fresh download.
+            if [[ "$treic_curl_status" == 33 ]]; then
+                rm -f "$treic_archive"
+            fi
+        fi
+        if [[ "$treic_attempt" -lt 20 ]]; then sleep 5; fi
+    done
+    if [[ "$treic_downloaded" != true ]]; then
+        echo "Download interrupted. Saved bytes remain at $treic_archive; rerun setup to resume." >&2
+        exit 1
+    fi
+    sudo systemctl stop ollama.service 2>/dev/null || true
+    sudo rm -rf /usr/local/lib/ollama
+    sudo tar --zstd -xf "$treic_archive" -C /usr/local
+    if ! id ollama >/dev/null 2>&1; then
+        sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+    fi
+    sudo tee /etc/systemd/system/ollama.service >/dev/null <<'UNIT'
+[Unit]
+Description=Ollama Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
 fi
 sudo systemctl enable --now ollama libvirtd
 sudo install -d -m 755 /opt/treics-agent-host /etc/treics-agent /etc/libvirt/hooks/network.d /etc/libvirt/hooks/qemu.d

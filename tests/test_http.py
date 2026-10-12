@@ -159,15 +159,40 @@ class HTTPTests(unittest.TestCase):
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
                                    ollama_token=self.proxy_token)
         client = ModelClient(cfg)
-        result, metrics = client.decide("Test task", "state", "notes", [], self.desktop.capture(), threading.Event())
+        budget = {"current_step": 7, "max_steps": 30, "steps_remaining": 24}
+        result, metrics = client.decide("Test task", "state", "notes", [], self.desktop.capture(),
+                                        threading.Event(), budget=budget)
         self.assertEqual(result["action"], "finish")
         self.assertEqual(metrics["eval_count"], 20)
         payload = self.upstream.payloads[-1]
         self.assertEqual(len(payload["messages"]), 2)
         self.assertEqual(len(payload["messages"][1]["images"]), 1)
+        self.assertEqual(json.loads(payload["messages"][1]["content"])["step_budget"], budget)
         self.assertEqual(payload["format"]["properties"]["action"]["enum"][-1], "finish")
         client.decide("Test task", "state", "notes", [], None, threading.Event())
         self.assertNotIn("images", self.upstream.payloads[-1]["messages"][1])
+
+    def test_dashboard_exposes_automatic_pause_reason_and_resume_control(self):
+        self.agent.model = FakeModel([decision("screenshot", {})] * 3 +
+                                     [decision("finish", {"summary": "Recovered"})])
+        controls = {"X-Treic-Agent": "1"}
+        status, body = request(self.api, "/api/start", "POST", {"task": "Loop", "max_steps": 100},
+                               self.cfg.dashboard_token, controls)
+        self.assertEqual(status, 201)
+        run_id = json.loads(body)["run_id"]
+        deadline = time.monotonic() + 3
+        while self.store.run(run_id)["status"] != "paused" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status, body = request(self.api, "/api/state", token=self.cfg.dashboard_token)
+        state = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(state["current"]["status"], "paused")
+        self.assertIn("Automatically paused", state["pause_reason"])
+        self.assertEqual(state["current"]["summary"], state["pause_reason"])
+        self.assertEqual(request(self.api, "/api/resume", "POST", {}, self.cfg.dashboard_token, controls)[0], 200)
+        self.agent.thread.join(3)
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+        self.assertIsNone(self.agent.snapshot()["pause_reason"])
 
     def test_cancel_interrupts_a_response_body_and_releases_proxy_slot(self):
         self.upstream.block = True

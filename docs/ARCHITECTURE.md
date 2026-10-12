@@ -17,7 +17,7 @@ flowchart TD
 
 ## Decision loop
 
-1. Capture the initial desktop, combine the task with current state and saved notes, and ask the model for one JSON action.
+1. Capture the initial desktop, combine the task with current state, saved notes, and its step budget, and ask the model for one JSON action. The budget includes the current step, maximum steps, and steps remaining including the current step; it is a ceiling, not a target.
 2. Validate the outer response and tool arguments. Invalid model text is never evaluated as Python or a shell command.
 3. Check pause, stop, and elapsed-time limits before executing the action.
 4. Execute the named tool, record the actual result, and capture a fresh screenshot after GUI work.
@@ -38,6 +38,8 @@ The guest has passwordless sudo to allow full control of its own OS. There are n
 The VM can access the public Internet. Task scope and permitted accounts still come from the user. Prompt instructions help the model stay on task but are not a security boundary; KVM, the scoped network rules and the restricted gateway are the actual boundaries.
 
 Pause takes effect at action boundaries. Stop cancels a model socket and the current shell process group; a GUI call already in progress may finish its small operation. Previous effects are not rolled back. Detached background programs need separate shutdown or a guest power-off. Controller restarts mark active runs interrupted and never restart old tasks automatically.
+
+The controller also pauses likely loops after three matching actions within the last twelve attempts without an observed change. GUI loops compare screenshots, ignoring small cursor/blink changes; shell and read tools compare identical arguments and results. Changed screenshots/results or file/note writes reset the check. Model-written state and reason text do not count as progress. This is a heuristic: deliberate polling or commands with identical output may also pause, and some loops may escape detection. The dashboard shows the reason and records a `stalled` event. Resume clears the loop check, captures a fresh desktop, and requests a new decision with recovery guidance. Stop ends the run. Pause time still counts against the run's elapsed-time limit.
 
 ## Local development
 

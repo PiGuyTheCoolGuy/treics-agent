@@ -7,6 +7,7 @@ import time
 
 from .config import Config
 from .model import Cancelled, ModelClient, ModelError
+from .progress import ProgressGuard
 from .storage import Store
 from .tools import ToolError, Tools
 
@@ -25,6 +26,7 @@ class Agent:
         self.condition = threading.Condition(self.lock)
         self.stop_event = threading.Event()
         self.paused = False
+        self.pause_reason: str | None = None
         self.thread: threading.Thread | None = None
         self.current: str | None = None
         self.phase = "idle"
@@ -42,6 +44,7 @@ class Agent:
             return {"current": self.store.run(self.current) if self.current else None,
                     "phase": self.phase, "phase_started": self.phase_started,
                     "last_model_seconds": self.last_model_seconds,
+                    "pause_reason": self.pause_reason,
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
                     "workspace": str(self.config.work_path), "runs": self.store.runs()}
 
@@ -56,6 +59,7 @@ class Agent:
                 raise ValueError("A task is already active. Stop it before starting another.")
             self.stop_event.clear()
             self.paused = False
+            self.pause_reason = None
             self.current = self.store.create_run(task.strip(), max_steps, self.config.model)
             self.tools.desktop.run_directory = self.config.data_path / "runs" / self.current
             self.set_phase("starting")
@@ -77,7 +81,14 @@ class Agent:
             if not self.paused or not self.thread or not self.thread.is_alive() or self.stop_event.is_set():
                 raise ValueError("No paused task to resume.")
             self.paused = False
-            self.store.update(self.current, status="running")
+            if self.pause_reason:
+                self.store.event(self.current, self.store.run(self.current)["step"], "resumed",
+                                 {"message": "Resumed after a detected loop. Choose a different approach "
+                                             "or finish with the blocker; do not repeat the stalled sequence."})
+                self.pause_reason = None
+                self.store.update(self.current, status="running", summary="")
+            else:
+                self.store.update(self.current, status="running")
             self.condition.notify_all()
 
     def stop(self) -> None:
@@ -122,11 +133,24 @@ class Agent:
                                       "excerpt": encoded[:3500], "context_truncated": True}
         return events
 
+    def _pause_stalled(self, run_id: str, step: int, reason: str, deadline: float) -> None:
+        with self.condition:
+            if self.stop_event.is_set():
+                raise Cancelled()
+            self.paused = True
+            self.pause_reason = reason
+            self.store.update(run_id, status="paused", summary=reason)
+            self.store.event(run_id, step, "stalled", {"message": reason})
+            self.set_phase("paused")
+            self.condition.notify_all()
+        self._gate(deadline)
+
     def _run(self, run_id: str) -> None:
         run = self.store.run(run_id)
         deadline = time.monotonic() + self.config.max_run_minutes * 60
         errors = 0
         screen = None
+        progress = ProgressGuard()
         try:
             self._gate(deadline)
             self.set_phase("observing")
@@ -139,7 +163,9 @@ class Agent:
                 try:
                     decision, metrics = self.model.decide(
                         run["task"], self.store.run(run_id)["state"], self.store.memory(),
-                        self._context_events(run_id), screen, self.stop_event)
+                        self._context_events(run_id), screen, self.stop_event,
+                        budget={"current_step": step, "max_steps": run["max_steps"],
+                                "steps_remaining": run["max_steps"] - step + 1})
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
@@ -155,6 +181,7 @@ class Agent:
                     if decision["action"] == "finish":
                         self.store.update(run_id, status="completed", summary=result["summary"])
                         return
+                    previous_screen = screen
                     if decision["action"] in self.tools.GUI_ACTIONS:
                         self._gate(deadline)
                         self.set_phase("observing")
@@ -163,6 +190,14 @@ class Agent:
                         screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
                         self.tools.desktop.frame = None
+                    reason = progress.observe(decision, result, previous_screen, screen)
+                    if reason and step < run["max_steps"]:
+                        self._pause_stalled(run_id, step, reason, deadline)
+                        progress.reset()
+                        # The user may have changed the desktop while it was paused.
+                        self._gate(deadline)
+                        self.set_phase("observing")
+                        screen = self.tools.desktop.capture()
                 except (ModelError, ToolError, OSError, ValueError) as exc:
                     if self.stop_event.is_set():
                         raise Cancelled() from exc
@@ -187,6 +222,9 @@ class Agent:
                 self.store.event(run_id, self.store.run(run_id)["step"], "error", {"message": str(exc)[:2000]})
                 self.store.update(run_id, status="failed", summary=str(exc)[:2000])
         finally:
+            with self.lock:
+                self.pause_reason = None
+                self.paused = False
             self.set_phase("idle")
 
     def shutdown(self) -> None:

@@ -15,6 +15,7 @@ from PIL import Image
 from treics_agent.agent import Agent
 from treics_agent.config import Config, initialize_config, load_config
 from treics_agent.model import ModelError, parse_decision
+from treics_agent.progress import ProgressGuard
 from treics_agent.storage import Store
 from treics_agent.tools import Desktop, ToolError, Tools
 
@@ -24,10 +25,11 @@ class FakeDesktop(Desktop):
         super().__init__(config)
         self.captures = 0
         self.commands = []
+        self.color = "#122037"
 
     def capture(self):
         self.captures += 1
-        image = Image.new("RGB", (1024, 768), "#122037")
+        image = Image.new("RGB", (1024, 768), self.color)
         output = io.BytesIO()
         image.save(output, format="JPEG")
         self.image = output.getvalue()
@@ -52,9 +54,13 @@ class FakeModel:
         self.release = threading.Event()
         self.release.set()
         self.calls = 0
+        self.budgets = []
+        self.events = []
 
-    def decide(self, task, state, memory, events, screen, stop):
+    def decide(self, task, state, memory, events, screen, stop, budget=None):
         self.screens.append(screen)
+        self.budgets.append(budget)
+        self.events.append(events)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
@@ -168,6 +174,100 @@ class AgentTests(unittest.TestCase):
         model.release.set()
         self.agent.thread.join(3)
         self.assertEqual(self.store.run(run_id)["status"], "limit_reached")
+
+    def wait_for_status(self, run_id, status):
+        deadline = time.monotonic() + 3
+        while self.store.run(run_id)["status"] != status and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.run(run_id)["status"], status)
+
+    def test_model_receives_decreasing_step_budget_and_can_finish_early(self):
+        model = self.build([decision("shell", {"command": "printf ready"}),
+                            decision("finish", {"summary": "Done early"})])
+        run = self.complete(max_steps=100)
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["step"], 2)
+        self.assertEqual(model.budgets, [
+            {"current_step": 1, "max_steps": 100, "steps_remaining": 100},
+            {"current_step": 2, "max_steps": 100, "steps_remaining": 99}])
+
+    def test_stalled_screenshots_pause_and_resume_with_fresh_observation(self):
+        model = self.build([decision("screenshot", {}, "Claimed progress " + str(i)) for i in range(3)] +
+                           [decision("write_file", {"path": "after-loop", "content": "ok"}),
+                            decision("finish", {"summary": "Recovered"})])
+        run_id = self.agent.start("Loop test", 100)
+        self.wait_for_status(run_id, "paused")
+        self.assertEqual(model.calls, 3)
+        self.assertFalse((self.config.work_path / "after-loop").exists())
+        self.assertIn("3 matching screenshot", self.agent.snapshot()["pause_reason"])
+        events = self.store.events(run_id)
+        self.assertEqual(events[-1]["kind"], "stalled")
+        # Inference stops while paused, even though every screenshot tool succeeded.
+        time.sleep(0.05)
+        self.assertEqual(model.calls, 3)
+        old_image = model.screens[-1]["base64"]
+        self.desktop.color = "#bbaadd"
+        self.agent.resume()
+        self.agent.thread.join(3)
+        self.assertFalse(self.agent.thread.is_alive())
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+        self.assertIsNone(self.agent.snapshot()["pause_reason"])
+        self.assertNotEqual(model.screens[3]["base64"], old_image)
+        self.assertTrue(any(e["kind"] == "resumed" for e in model.events[3]))
+        self.assertEqual(model.budgets[3]["steps_remaining"], 97)
+        self.assertEqual((self.config.work_path / "after-loop").read_text(), "ok")
+
+    def test_stop_while_automatically_paused_prevents_next_action(self):
+        model = self.build([decision("screenshot", {})] * 3 +
+                           [decision("write_file", {"path": "forbidden", "content": "bad"})])
+        run_id = self.agent.start("Stop loop")
+        self.wait_for_status(run_id, "paused")
+        self.agent.stop()
+        self.agent.thread.join(3)
+        self.assertFalse(self.agent.thread.is_alive())
+        self.assertEqual(self.store.run(run_id)["status"], "stopped")
+        self.assertEqual(model.calls, 3)
+        self.assertFalse((self.config.work_path / "forbidden").exists())
+
+    def test_step_limit_still_ends_run_when_last_action_would_trigger_pause(self):
+        model = self.build([decision("screenshot", {})] * 3)
+        run = self.complete(max_steps=3)
+        self.assertEqual(run["status"], "limit_reached")
+        self.assertEqual(model.budgets[-1]["steps_remaining"], 1)
+
+    def test_loop_guard_detects_cycles_but_resets_on_observed_progress(self):
+        guard = ProgressGuard()
+        screen = self.desktop.capture()
+        result = {"ok": True}
+        click = decision("click", {"x": 30, "y": 40})
+        screenshot = decision("screenshot", {})
+        for action in (click, screenshot, click, screenshot):
+            self.assertIsNone(guard.observe(action, result, screen, screen))
+        self.assertIn("3 matching click", guard.observe(click, result, screen, screen))
+        self.desktop.color = "#8899ff"
+        changed = self.desktop.capture()
+        self.assertIsNone(guard.observe(click, result, screen, changed))
+        self.assertIsNone(guard.observe(click, result, changed, changed))
+        self.assertIsNone(guard.observe(click, result, changed, changed))
+        # A deliberate text/file step breaks the unchanged desktop sequence.
+        guard.observe(decision("write_file", {"path": "x", "content": "y"}), result, None, None)
+        self.assertIsNone(guard.observe(click, result, changed, changed))
+
+    def test_loop_guard_ignores_tiny_cursor_changes_and_detects_changed_output(self):
+        guard = ProgressGuard()
+        screen = self.desktop.capture()
+        image = Image.open(io.BytesIO(base64.b64decode(screen["base64"])))
+        image.paste("white", (100, 100, 102, 102))
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG")
+        changed = {**screen, "captured_at": time.time(), "base64": base64.b64encode(encoded.getvalue()).decode()}
+        self.assertTrue(guard.same_screen(screen, changed))
+        cmd = decision("shell", {"command": "printf ready"})
+        for output in ("ready", "ready", "different", "different"):
+            self.assertIsNone(guard.observe(cmd, {"ok": True, "output": output}, None, None))
+        self.assertIn("same result", guard.observe(cmd, {"ok": True, "output": "different"}, None, None))
+        guard.reset()
+        self.assertIsNone(guard.observe(cmd, {"ok": True, "output": "different"}, None, None))
 
     def test_shell_timeout_and_output_limit(self):
         stopped = threading.Event()

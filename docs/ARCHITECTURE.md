@@ -60,3 +60,5 @@ bash -n scripts/*.sh
 ```
 
 Use `treics-agent doctor --test-model` to verify the real guest and model. Unit/integration tests use a simulated X11 capture and local simulated Ollama service while exercising actual file, shell and network-controller behavior. They do not establish model intelligence, task success rates, CPU speed, or VM provisioning success on the R620.
+
+To isolate history effects, stop the current task and run `.venv/bin/python scripts/diagnose-model.py` inside the guest. It makes two requests using the real system prompt, action schema, model options, and gateway: a fresh-context script proposal and the same proposal with recent failed history. It omits screenshots and persistent notes in both cases and executes no proposed actions. The database is opened read-only. `--run-id` selects a specific run; otherwise it uses the most recent failed run among the last thirty. JSON output contains the requests, responses, and syntax checks; progress goes to stderr. Review the output before sharing because historical tool results may contain private information. Authorization headers and proxy tokens are not included.

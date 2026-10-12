@@ -30,6 +30,7 @@ def script_module(name):
 
 proxy_module = script_module("model-proxy")
 vm_module = script_module("vm-config")
+diagnostic_module = script_module("diagnose-model")
 
 
 def request(server, path, method="GET", body=None, token=None, extra=None):
@@ -180,6 +181,42 @@ class HTTPTests(unittest.TestCase):
         self.upstream.decision = decision("type", {"text": "https://example.com", "paste_keys": []})
         with self.assertRaisesRegex(ModelError, "type.arguments.paste_keys"):
             ModelClient(cfg).decide("Type", "", "", [], self.desktop.capture(), threading.Event())
+
+    def test_model_diagnostic_changes_only_history_without_executing_actions_or_recovering_runs(self):
+        run_id = self.store.create_run("Failed extraction", 10, self.cfg.model)
+        self.store.event(run_id, 1, "action", {"decision": decision("shell", {"command": "broken parser"}),
+                                               "result": {"ok": False, "output": "SyntaxError"}})
+        target = Path(self.temp.name) / "must-not-exist.py"
+        self.upstream.decision = decision("write_file", {"path": str(target), "content": "print('Example Domain')\n"})
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        before = self.store.run(run_id)
+        report = diagnostic_module.collect_report(cfg, run_id)
+        self.assertEqual(self.store.run(run_id), before)
+        self.assertFalse(target.exists())
+        self.assertEqual(len(report["cases"]), 2)
+        self.assertTrue(all(case["validation"]["syntax_valid"] for case in report["cases"]))
+        fresh, history = [case["request"] for case in report["cases"]]
+        fresh_context = json.loads(fresh["messages"][1]["content"])
+        history_context = json.loads(history["messages"][1]["content"])
+        self.assertEqual(fresh_context["recent_events"], [])
+        self.assertEqual(history_context["recent_events"][0]["data"]["result"]["output"], "SyntaxError")
+        history_context["recent_events"] = []
+        self.assertEqual(fresh_context, history_context)
+        history["messages"][1]["content"] = fresh["messages"][1]["content"]
+        self.assertEqual(fresh, history)
+        self.assertNotIn(self.proxy_token, json.dumps(report))
+
+    def test_model_diagnostic_retains_invalid_response_and_detects_bad_python(self):
+        run_id = self.store.create_run("Failed run", 10, self.cfg.model)
+        self.store.event(run_id, 1, "error", {"message": "Example failure"})
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        self.upstream.decision = decision("type", {"text": "x", "paste_keys": []})
+        report = diagnostic_module.collect_report(cfg, run_id)
+        self.assertTrue(all("error" in case and case["response"] for case in report["cases"]))
+        review = diagnostic_module.check_proposal(decision("write_file", {"path": "x.py", "content": "import sys; class P: pass"}))
+        self.assertFalse(review["syntax_valid"])
 
     def test_dashboard_exposes_automatic_pause_reason_and_resume_control(self):
         self.agent.model = FakeModel([decision("screenshot", {})] * 3 +

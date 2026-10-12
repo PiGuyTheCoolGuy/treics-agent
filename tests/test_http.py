@@ -161,14 +161,16 @@ class HTTPTests(unittest.TestCase):
                                    ollama_token=self.proxy_token)
         client = ModelClient(cfg)
         budget = {"current_step": 7, "max_steps": 30, "steps_remaining": 24}
+        filesystem = self.agent.tools.filesystem_context([])
         result, metrics = client.decide("Test task", "state", "notes", [], self.desktop.capture(),
-                                        threading.Event(), budget=budget)
+                                        threading.Event(), budget=budget, filesystem=filesystem)
         self.assertEqual(result["action"], "finish")
         self.assertEqual(metrics["eval_count"], 20)
         payload = self.upstream.payloads[-1]
         self.assertEqual(len(payload["messages"]), 2)
         self.assertEqual(len(payload["messages"][1]["images"]), 1)
         self.assertEqual(json.loads(payload["messages"][1]["content"])["step_budget"], budget)
+        self.assertEqual(json.loads(payload["messages"][1]["content"])["filesystem"], filesystem)
         cases = {c["properties"]["action"]["enum"][0]: c for c in payload["format"]["anyOf"]}
         self.assertIn("finish", cases)
         self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 767)

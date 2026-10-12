@@ -58,12 +58,21 @@ class ProgressGuard:
         elif action in {"shell", "read_file", "list_files"}:
             # The same output is evidence of a possible loop, not proof that a command
             # had no effects. Deliberate polling can be continued with Resume.
-            observation = signature + json.dumps(result, sort_keys=True, ensure_ascii=False)
+            # Existing-directory skips have the same observed postcondition as
+            # the first successful mkdir. A changed message is not progress.
+            stable_result = result
+            if action == "shell" and "directories" in result:
+                stable_result = {key: value for key, value in result.items()
+                                 if key not in {"skipped", "message"}}
+            observation = signature + json.dumps(stable_result, sort_keys=True, ensure_ascii=False)
             fingerprint = hashlib.sha256(observation.encode()).hexdigest()
             if fingerprint != self.last_text_result:
                 self._reset_attempts()
             self.last_text_result = fingerprint
             evidence = "the tool returned the same result"
+        elif action == "write_file" and result.get("skipped"):
+            self.last_text_result = None
+            evidence = "the file already contained exactly the requested content"
         else:
             self.reset()
             return None

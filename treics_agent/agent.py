@@ -162,11 +162,13 @@ class Agent:
                 started = time.monotonic()
                 decision = None
                 try:
+                    context_events = self._context_events(run_id)
                     decision, metrics = self.model.decide(
                         run["task"], self.store.run(run_id)["state"], self.store.memory(),
-                        self._context_events(run_id), screen, self.stop_event,
+                        context_events, screen, self.stop_event,
                         budget={"current_step": step, "max_steps": run["max_steps"],
-                                "steps_remaining": run["max_steps"] - step + 1})
+                                "steps_remaining": run["max_steps"] - step + 1},
+                        filesystem=self.tools.filesystem_context(context_events))
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
@@ -174,7 +176,7 @@ class Agent:
                     self.set_phase("action")
                     self.store.event(run_id, step, "action_started", {"decision": decision})
                     result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
-                    if result.get("ok", False):
+                    if result.get("ok", False) and not result.get("skipped", False):
                         self.store.update(run_id, state=decision["state"])
                     self.store.event(run_id, step, "action", {"decision": decision, "result": result,
                                                              "model_seconds": self.last_model_seconds,

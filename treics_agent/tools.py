@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -139,14 +141,97 @@ class Tools:
         path = Path(text(value, "path", 4096)).expanduser()
         return path if path.is_absolute() else self.config.work_path / path
 
+    def filesystem_context(self, events: list[dict]) -> dict:
+        """Read bounded metadata for the workspace and recently referenced paths."""
+        paths = [self.config.work_path]
+        for event in reversed(events):
+            arguments = event["data"].get("decision", {}).get("arguments", {})
+            for key in ("path", "cwd"):
+                if value := arguments.get(key):
+                    try:
+                        path = self.resolve(value)
+                    except (ToolError, OSError, ValueError):
+                        continue
+                    if path not in paths and len(paths) < 12:
+                        paths.append(path)
+        context = {"paths": [], "paths_truncated": False,
+                   "workspace_entries": [], "entries_truncated": False}
+        for path in paths:
+            entry = {"path": str(path)}
+            try:
+                info = path.stat()
+                entry["kind"] = ("directory" if stat.S_ISDIR(info.st_mode) else
+                                 "file" if stat.S_ISREG(info.st_mode) else "other")
+                if entry["kind"] == "file":
+                    entry["bytes"] = info.st_size
+            except FileNotFoundError:
+                entry["kind"] = "missing"
+            except OSError as exc:
+                entry.update(kind="unavailable", error=str(exc)[:300])
+            context["paths"].append(entry)
+            if len(json.dumps(context, ensure_ascii=False)) > 3000:
+                context["paths"].pop()
+                context["paths_truncated"] = True
+        try:
+            with os.scandir(self.config.work_path) as iterator:
+                for entry in iterator:
+                    if len(context["workspace_entries"]) == 20:
+                        context["entries_truncated"] = True
+                        break
+                    context["workspace_entries"].append({
+                        "name": entry.name, "directory": entry.is_dir(follow_symlinks=False)})
+                    if len(json.dumps(context, ensure_ascii=False)) > 3000:
+                        context["workspace_entries"].pop()
+                        context["entries_truncated"] = True
+                        break
+            context["workspace_entries"].sort(key=lambda entry: entry["name"])
+        except OSError as exc:
+            context["workspace_error"] = str(exc)[:300]
+        return context
+
+    @staticmethod
+    def directory_setup_paths(command: str, cwd: Path) -> list[Path]:
+        # Recognize only plain, unquoted mkdir -p operands. Anything with shell
+        # expansion, operators, quoting or additional options runs normally.
+        if not re.fullmatch(r"[A-Za-z0-9_./~ \t-]+", command):
+            return []
+        words = command.split()
+        if words[:2] != ["mkdir", "-p"]:
+            return []
+        operands = words[2:]
+        if operands[:1] == ["--"]:
+            operands = operands[1:]
+        if not operands or len(operands) > 32 or any(
+                word.startswith("-") or not re.fullmatch(r"(?:~/)?[A-Za-z0-9_./-]+", word)
+                for word in operands):
+            return []
+        paths = [Path(word).expanduser() for word in operands]
+        return [path if path.is_absolute() else cwd / path for path in paths]
+
+    @staticmethod
+    def directory_observations(paths: list[Path]) -> list[dict]:
+        return [{"path": str(path), "directory": path.is_dir()} for path in paths]
+
     def shell(self, arguments: dict, stop: threading.Event) -> dict:
         command = text(arguments["command"], "command", 32000)
         cwd = self.resolve(arguments.get("cwd", str(self.config.work_path)))
         timeout = number(arguments.get("timeout", self.config.shell_timeout), "timeout", 1, 600, True)
         if not cwd.is_dir():
-            raise ToolError(f"Working directory does not exist: {cwd}")
+            raise ToolError(f"Working directory does not exist: {cwd}. No command was started, "
+                            "so directory creation inside it could not run. Omit cwd to use the "
+                            f"existing workspace ({self.config.work_path}), or use write_file, "
+                            "which creates parent directories automatically.")
         if stop.is_set():
             raise Cancelled()
+        setup_paths = self.directory_setup_paths(command, cwd)
+        directories = self.directory_observations(setup_paths)
+        if directories and all(entry["directory"] for entry in directories):
+            return {"ok": True, "exit_code": 0, "timed_out": False, "output": "",
+                    "truncated": False, "cwd": str(cwd), "skipped": True,
+                    "directories": directories,
+                    "message": "These directories already exist; no command was run. "
+                               "Continue with the next task step. write_file creates parent "
+                               "directories automatically; no mkdir or touch is needed first."}
         process = subprocess.Popen(["/bin/bash", "-o", "pipefail", "-lc", command], cwd=cwd, env=self.config.desktop_env(),
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         with self.process_lock:
@@ -176,9 +261,15 @@ class Tools:
                 process.wait(timeout=5)
             if stop.is_set():
                 raise Cancelled()
-            return {"ok": process.returncode == 0 and not timed_out,
-                    "exit_code": process.returncode, "timed_out": timed_out,
-                    "output": output.decode(errors="replace"), "truncated": truncated, "cwd": str(cwd)}
+            result = {"ok": process.returncode == 0 and not timed_out,
+                      "exit_code": process.returncode, "timed_out": timed_out,
+                      "output": output.decode(errors="replace"), "truncated": truncated, "cwd": str(cwd)}
+            if setup_paths:
+                result["directories"] = self.directory_observations(setup_paths)
+                if result["ok"]:
+                    result["message"] = ("Directory setup completed successfully. Empty output is normal. "
+                                         "Continue with the next task step; do not repeat setup.")
+            return result
         finally:
             if process.poll() is None:
                 self.kill(process)
@@ -217,6 +308,19 @@ class Tools:
             path = self.resolve(a["path"])
             content = text(a["content"], "content")
             path.parent.mkdir(parents=True, exist_ok=True)
+            encoded = content.encode("utf-8")
+            try:
+                if path.is_file() and path.stat().st_size == len(encoded):
+                    with path.open("rb") as handle:
+                        if handle.read(len(encoded) + 1) == encoded:
+                            return {"ok": True, "path": str(path), "characters": len(content),
+                                    "skipped": True, "message": "The file already contains exactly this "
+                                    "content; no write was performed. Continue by running or verifying "
+                                    "it, or making the next requested change."}
+            except OSError:
+                # A file may be writable without being readable; inability to
+                # compare it must not prevent the requested write.
+                pass
             path.write_text(content, encoding="utf-8")
             return {"ok": True, "path": str(path), "characters": len(content)}
         if action == "list_files":

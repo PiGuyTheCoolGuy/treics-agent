@@ -20,9 +20,9 @@ TOOLS = {
     "type": '{"text":str,"paste_keys":["ctrl","v"] optional}: Unicode clipboard paste; use ["ctrl","shift","v"] in terminals.',
     "press": '{"key":str}: X11 key names, e.g. Return, Tab, Escape, BackSpace, F5.',
     "hotkey": '{"keys":[str,...]}: e.g. ["ctrl","l"], ["alt","F4"].',
-    "shell": '{"command":str,"cwd":str optional,"timeout":int optional}: run bash inside THIS VM. Prefer this for code, files, packages, HTTP requests and tests.',
+    "shell": '{"command":str,"cwd":str optional,"timeout":int optional}: run bash inside THIS VM. cwd must already exist; omit it to use the workspace. Prefer this for code, files, HTTP requests and tests.',
     "read_file": '{"path":str,"offset":int optional,"limit":int optional}: read UTF-8 text; offset is in characters.',
-    "write_file": '{"path":str,"content":str}: create or replace a UTF-8 file.',
+    "write_file": '{"path":str,"content":str}: create or replace a UTF-8 file, creating parent directories automatically. No mkdir or touch is needed first.',
     "list_files": '{"path":str optional}: list a directory.',
     "open_browser": '{"url":str}: open an http(s) URL in the guest browser.',
     "wait": '{"seconds":number}: wait 0.1–30 seconds, then get a new screenshot.',
@@ -91,6 +91,14 @@ when configured, but cannot control the host. Prefer terminal and file tools for
 Follow the task's requested order and tools. The current browser page is incidental context,
 not a reason to browse. Fetching a page with shell means calling shell with curl or Python;
 there is no need to open a terminal or navigate the browser first.
+write_file creates parent directories: write the requested file directly without mkdir or touch.
+shell checks cwd BEFORE starting the command, so do not set cwd to a directory you plan to create.
+Successful directory setup with empty stdout is complete; proceed to the next requested step.
+filesystem contains freshly observed path metadata, not file contents. A historical missing-directory
+error is no longer a blocker when that path is now observed as a directory. Omitted paths or entries
+in truncated metadata do not prove absence; use explicit path observations or a file tool.
+A result with skipped=true means the requested directory/content already exists. It is not new
+progress. Do not repeat it; continue to the next task step, verify the result, or finish with a blocker.
 For browser navigation prefer open_browser. For type, omit paste_keys to use Ctrl+V;
 never send an empty paste_keys array. Tool errors identify the action that actually failed.
 For GUI work, inspect screenshots and use screenshot pixel coordinates (origin at top left).
@@ -312,13 +320,14 @@ class ModelClient:
 
     def decide(self, task: str, state: str, memory: str, events: list[dict],
                screen: dict | None, stop: threading.Event,
-               budget: dict | None = None) -> tuple[dict, dict]:
+               budget: dict | None = None, filesystem: dict | None = None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items())
         context = {
             "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
             "recent_events": recent_observations(events),
             "step_budget": budget,
+            "filesystem": filesystem,
             "screen": ({k: v for k, v in screen.items() if k != "base64"} if screen else None),
             "task": task,
         }

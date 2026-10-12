@@ -58,12 +58,14 @@ class FakeModel:
         self.budgets = []
         self.events = []
         self.states = []
+        self.filesystems = []
 
-    def decide(self, task, state, memory, events, screen, stop, budget=None):
+    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)
         self.states.append(state)
+        self.filesystems.append(filesystem)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
@@ -114,6 +116,125 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(any(e["data"].get("result", {}).get("output") == "你好 Owen" for e in events))
         self.assertIn("hello.txt", self.store.memory())
         self.assertEqual(run["step"], 4)
+
+    def test_logged_missing_cwd_then_mkdir_loop_skips_repeats_and_preserves_observed_state(self):
+        target = self.config.work_path / "sales-test"
+        setup = {"command": "mkdir -p sales-test", "cwd": str(self.config.work_path)}
+        failed = decision("shell", {"command": "mkdir -p sales-test && touch sales.csv",
+                                    "cwd": str(target)}, "Falsely claimed CSV was created")
+        model = self.build([failed, decision("shell", setup, "Directory created; next write CSV"),
+                            decision("shell", setup, "Falsely claimed CSV was written"),
+                            decision("shell", setup, "Falsely claimed analysis was finished"),
+                            decision("write_file", {"path": "sales-test/sales.csv", "content": "order_id\n1001\n"}),
+                            decision("finish", {"summary": "Created CSV after resuming"})])
+        with mock.patch.object(self.agent.stop_event, "wait", side_effect=lambda timeout: self.agent.stop_event.is_set()):
+            run_id = self.agent.start("Reproduce uploaded directory loop", 20)
+            self.wait_for_status(run_id, "paused")
+            self.assertEqual(model.calls, 4)
+            self.assertIn("3 matching shell", self.agent.snapshot()["pause_reason"])
+            self.assertEqual(model.states[1], "")
+            self.assertEqual(self.store.run(run_id)["state"], "Directory created; next write CSV")
+            before = {p["path"]: p["kind"] for p in model.filesystems[1]["paths"]}
+            after = {p["path"]: p["kind"] for p in model.filesystems[2]["paths"]}
+            self.assertEqual(before[str(target)], "missing")
+            self.assertEqual(after[str(target)], "directory")
+            results = [e["data"]["result"] for e in self.store.events(run_id) if e["kind"] == "action"]
+            self.assertTrue(results[0]["directories"][0]["directory"])
+            self.assertTrue(all(r.get("skipped") for r in results[1:]))
+            self.assertFalse((target / "sales.csv").exists())
+            self.agent.resume()
+            self.agent.thread.join(3)
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+        self.assertEqual((target / "sales.csv").read_text(), "order_id\n1001\n")
+
+    def test_directory_setup_feedback_skips_only_plain_mkdir_with_existing_targets(self):
+        stop = threading.Event()
+        args = {"command": "mkdir -p sales-test archive"}
+        result = self.tools.execute("shell", args, stop)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result.get("skipped", False))
+        self.assertEqual(result["output"], "")
+        self.assertIn("completed successfully", result["message"])
+        with mock.patch("treics_agent.tools.subprocess.Popen") as popen:
+            repeated = self.tools.execute("shell", args, stop)
+            popen.assert_not_called()
+        self.assertTrue(repeated["skipped"])
+        self.assertEqual(repeated["directories"], result["directories"])
+        # Compound commands, quoted paths, shell expansions, flags and newlines
+        # must retain normal Bash semantics, even when a directory exists.
+        for command in ("mkdir -p sales-test && printf done", "mkdir -p 'sales-test'",
+                        "mkdir -p $HOME/sales-test", "mkdir -m 700 -p sales-test",
+                        "mkdir -p sales-test\nprintf done", "mkdir -p ~/x; printf done",
+                        "mkdir -p sales-test\varchive", "mkdir -p sales-test\u00a0archive"):
+            self.assertEqual(Tools.directory_setup_paths(command, self.config.work_path), [])
+        combined = self.tools.execute("shell", {"command": "mkdir -p sales-test && printf done"}, stop)
+        self.assertFalse(combined.get("skipped", False))
+        self.assertEqual(combined["output"], "done")
+        parsed = Tools.directory_setup_paths("mkdir -p -- ~/dir /tmp/dir relative", self.config.work_path)
+        self.assertEqual(parsed, [Path.home() / "dir", Path("/tmp/dir"), self.config.work_path / "relative"])
+        (self.config.work_path / "ordinary-file").write_text("preserve me")
+        result = self.tools.execute("shell", {"command": "mkdir -p ordinary-file"}, stop)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["directories"][0]["directory"])
+        self.assertEqual((self.config.work_path / "ordinary-file").read_text(), "preserve me")
+
+    def test_missing_cwd_does_not_create_it_and_reports_command_was_not_started(self):
+        path = self.config.work_path / "missing"
+        with self.assertRaisesRegex(ToolError, "No command was started"):
+            self.tools.execute("shell", {"command": "mkdir -p missing", "cwd": str(path)}, threading.Event())
+        self.assertFalse(path.exists())
+
+    def test_identical_file_write_is_skipped_without_changing_mtime_and_still_pauses_loop(self):
+        args = {"path": "new/nested/script.py", "content": "print('你好')\n"}
+        first = self.tools.execute("write_file", args, threading.Event())
+        self.assertTrue(first["ok"])
+        path = self.config.work_path / args["path"]
+        before = path.stat().st_mtime_ns
+        with mock.patch.object(Path, "write_text", side_effect=AssertionError("unexpected rewrite")):
+            repeated = self.tools.execute("write_file", args, threading.Event())
+        self.assertTrue(repeated["skipped"])
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        self.assertEqual(path.read_text(), args["content"])
+        model = self.build([decision("write_file", args, "Unsupported new progress")] * 3 +
+                           [decision("finish", {"summary": "Blocked"})])
+        run_id = self.agent.start("Identical writes", 6)
+        self.wait_for_status(run_id, "paused")
+        self.assertEqual(self.store.run(run_id)["state"], "")
+        self.assertEqual(model.calls, 3)
+        self.assertIn("3 matching write_file", self.agent.snapshot()["pause_reason"])
+        self.agent.resume()
+        self.agent.thread.join(3)
+        changed = {**args, "content": "print('再见')\n"}
+        result = self.tools.execute("write_file", changed, threading.Event())
+        self.assertFalse(result.get("skipped", False))
+        self.assertEqual(path.read_text(), changed["content"])
+
+    def test_filesystem_observations_are_bounded_and_never_read_file_contents(self):
+        names = [f"file-{i}-" + "a" * 210 + ".txt" for i in range(25)]
+        for name in names:
+            (self.config.work_path / name).write_text("contents must not enter the context")
+        events = [{"data": {"decision": decision("read_file", {"path": name})}} for name in names]
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("read contents")):
+            context = self.tools.filesystem_context(events)
+        self.assertLessEqual(len(context["paths"]), 12)
+        self.assertLessEqual(len(context["workspace_entries"]), 20)
+        self.assertLessEqual(len(json.dumps(context, ensure_ascii=False)), 3000)
+        self.assertTrue(context["entries_truncated"])
+        self.assertNotIn("contents must not enter the context", json.dumps(context))
+
+    def test_write_file_can_replace_a_writable_file_that_cannot_be_read_for_comparison(self):
+        path = self.config.work_path / "write-only.txt"
+        path.write_text("old data")
+        original_open = Path.open
+        def deny_comparison_open(path, mode="r", *args, **kwargs):
+            if mode == "rb":
+                raise PermissionError("File is not readable")
+            return original_open(path, mode, *args, **kwargs)
+        with mock.patch.object(Path, "open", deny_comparison_open):
+            result = self.tools.execute("write_file", {"path": str(path), "content": "new data"}, threading.Event())
+        self.assertTrue(result["ok"])
+        self.assertFalse(result.get("skipped", False))
+        self.assertEqual(path.read_text(), "new data")
 
     def test_only_latest_screenshot_and_refresh_after_gui(self):
         model = self.build([

@@ -21,13 +21,17 @@ flowchart TD
 2. Validate the outer response and tool arguments. Invalid model text is never evaluated as Python or a shell command.
 3. Check pause, stop, and elapsed-time limits before executing the action.
 4. Execute the named tool, record the actual result, and capture a fresh screenshot after GUI work.
-5. Feed compact observed results and the newest state into the next decision, with the current task last in the message. A `finish` action ends the task.
+5. Feed compact observed results, fresh filesystem metadata, and the newest state into the next decision, with the current task last in the message. A `finish` action ends the task.
 
 Model context excludes historical reason/state claims and failed action arguments. Successful arguments retain paths and control parameters, short command/text previews, and file-content sizes. Results retain exit status, output, and error messages, with long traceback source lines omitted. The full original events remain in the database and dashboard. No-image context is represented by `null`, rather than another instruction to request a screenshot.
+
+Each decision also receives fresh metadata for the workspace and up to eleven recently referenced file/working-directory paths, including failed actions' paths. A shallow workspace listing is capped at twenty entries; metadata also has a character cap and reports omitted paths/entries. It does not read file contents or recurse. This lets the model distinguish a historical missing-directory error from the current existence of that directory. The diagnostic probes leave this optional live context absent to keep their comparisons controlled.
 
 For shell/file/note actions the next prompt omits images, and previous coordinates are invalidated. The model requests a screenshot before returning to coordinate actions. Screenshot coordinates are mapped to the actual desktop when the image is downscaled.
 
 Shell commands run with Bash `pipefail`, so a failed extraction or download inside a pipeline is not hidden by a successful final command. A shell action's proposed state is saved only when the command succeeds; its exit status and output remain in the activity log either way.
+
+The shell validates `cwd` before starting Bash and explains that no part of the command ran when `cwd` is missing. Plain `mkdir -p` commands with simple unquoted paths report the observed directory postconditions; when all targets already exist, execution is skipped with explicit guidance to continue. Compound commands, shell expansions, quoted operands and other options retain normal Bash behavior. `write_file` creates parent directories and skips a rewrite when the existing bytes match exactly. Skips are logged, consume a decision step, and cannot replace working state with a new model claim of progress. Commands used for ordinary polling are not skipped.
 
 Only a short action description is requested, alongside a compact working summary. The model does not need to generate a long reasoning transcript. JSON is constrained by Ollama's schema format and independently validated locally. The controller does not require native tool-call parsing from Qwen.
 
@@ -45,9 +49,9 @@ The VM can access the public Internet. Task scope and permitted accounts still c
 
 Pause takes effect at action boundaries. Stop cancels a model socket and the current shell process group; a GUI call already in progress may finish its small operation. Previous effects are not rolled back. Detached background programs need separate shutdown or a guest power-off. Controller restarts mark active runs interrupted and never restart old tasks automatically.
 
-The controller also pauses likely loops after three matching actions within the last twelve attempts without an observed change. GUI loops compare screenshots, ignoring small cursor/blink changes; shell and read tools compare identical arguments and results. Changed screenshots/results or file/note writes reset the check. Model-written state and reason text do not count as progress. This is a heuristic: deliberate polling or commands with identical output may also pause, and some loops may escape detection. The dashboard shows the reason and records a `stalled` event. Resume clears the loop check, captures a fresh desktop, and requests a new decision with recovery guidance. Stop ends the run. Pause time still counts against the run's elapsed-time limit.
+The controller also pauses likely loops after three matching actions within the last twelve attempts without an observed change. GUI loops compare screenshots, ignoring small cursor/blink changes; shell and read tools compare identical arguments and results. Directory-setup comparisons ignore the message/skip flag so the transition from successful creation to existing-directory skips does not reset detection. Repeated identical file rewrites also count as no progress. Changed screenshots/results or actual file/note writes reset the check. Model-written state and reason text do not count as progress. This is a heuristic: deliberate polling or commands with identical output may also pause, and some loops may escape detection. The dashboard shows the reason and records a `stalled` event. Resume clears the loop check, captures a fresh desktop, and requests a new decision with recovery guidance. Stop ends the run. Pause time still counts against the run's elapsed-time limit.
 
-Repeated errors are tracked separately: three matching action/error messages within twelve attempts also pause the run, even when successful GUI actions or changed screenshots occur between failures. File/note writes or Resume reset this error check.
+Repeated errors are tracked separately: three matching action/error messages within twelve attempts also pause the run, even when successful GUI actions or changed screenshots occur between failures. Actual file/note writes or Resume reset this error check.
 
 ## Local development
 

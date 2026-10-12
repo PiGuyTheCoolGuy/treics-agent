@@ -16,4 +16,4 @@ treics-agent = "treics_agent.cli:main"
 include = ["treics_agent*"]
 
 [tool.setuptools.package-data]
-treics_agent = ["static/*.html"]
+treics_agent = ["static/*.html", "static/*.js"]

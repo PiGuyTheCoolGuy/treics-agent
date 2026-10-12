@@ -13,6 +13,9 @@ display = ":99"
 xauthority = "~/.Xauthority"
 screen_width = 1024
 screen_height = 768
+# Live dashboard only; these do not change the model's screenshot schedule.
+stream_fps = 5
+stream_quality = 70
 work_dir = "~/agent-workspace"
 data_dir = "~/.local/share/treics-agent"
 max_steps = 100

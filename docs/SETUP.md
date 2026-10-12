@@ -66,7 +66,11 @@ ssh -N -L 8010:192.168.152.10:8010 treic@YOUR_SERVER_IP
 
 Open <http://localhost:8010> and paste the dashboard token. Use the address you already use to SSH into your R620, including a Tailscale address if applicable. If laptop port 8010 is occupied, use `-L 8012:192.168.152.10:8010` and open `http://localhost:8012`.
 
-Start with the README example. Then try file generation, coding and verification tasks before longer GUI workflows. The dashboard shows the model wait time, chosen tools, outputs, run summaries, and the latest screen. Model-call time includes prompt processing and generation. Screenshots displayed during terminal-only work are explicitly the most recent capture, not a video feed.
+Start with the README example. Then try file generation, coding and verification tasks before longer GUI workflows. The dashboard shows the model wait time, chosen tools, outputs, run summaries, and a live full-desktop feed. Model-call time includes prompt processing and generation. The stream keeps updating during inference, terminal/file work, pause, and idle time, independently of screenshots sent to the model.
+
+Live viewing starts when you connect, using the same token and SSH tunnel. **Pause live view** suspends only the feed; **Resume live view** starts it again. Hiding the tab suspends its connection until you return. Dropped streams reconnect automatically. The mouse pointer and last-click marker appear in the feed, and model zooms leave the viewer on the full desktop. With the feed paused and no running task, **Capture desktop** remains available for a single snapshot.
+
+The default is a 5 FPS target at JPEG quality 70. To adjust it, add `stream_fps = 5` (1–15) and `stream_quality = 70` (30–95) to the guest's configuration and restart the controller. Up to four viewers share one on-demand capture worker. More FPS/quality uses more guest CPU and tunnel bandwidth; start with the defaults on the R620. The normal project dependencies provide capture; no additional port, VNC setup, or video service is needed. `doctor` reports whether Pillow's native X11 capture is available.
 
 ## 4. Configure or switch models
 
@@ -138,7 +142,7 @@ git pull --ff-only
 bash scripts/ssh-vm.sh 'systemctl --user stop treics-agent && cd ~/treics-agent && git pull --ff-only && bash scripts/install-guest.sh --skip-apt && systemctl --user restart treics-agent'
 ```
 
-The installer refreshes Python dependencies (including python-xlib for the live last-click marker) and preserves the existing configuration. No desktop rebuild or model download is needed for the zoom/marker update. Refresh the dashboard after restarting. The full-desktop preview shows the last click in red even while the model examines a zoomed crop; a caption reports that crop's location and dimensions. If the live marker cannot connect to X11 or takes longer than three seconds to respond, its helper is stopped, the preview still marks clicks, and the dashboard reports the live-marker error. Dashboard status and controls use cached desktop state and remain available during a stalled desktop operation.
+The installer refreshes Python dependencies (including python-xlib for the live last-click marker) and preserves the existing configuration. No desktop rebuild or model download is needed for the zoom/marker/stream update. Refresh the dashboard after restarting; the live feed starts when you reconnect. Existing configurations automatically use the stream defaults without adding settings. The full-desktop view shows the last click in red even while the model examines a zoomed crop; a caption reports that crop's location and dimensions. If the live marker cannot connect to X11 or takes longer than three seconds to respond, its helper is stopped, the viewer still marks clicks, and the dashboard reports the live-marker error. Dashboard status and controls use cached desktop state and remain available during a stalled desktop operation.
 
 If the agent accidentally opens XFCE's top-right `agent` menu over the browser's close button, dismiss it from **treicserver**:
 
@@ -146,7 +150,7 @@ If the agent accidentally opens XFCE's top-right `agent` menu over the browser's
 bash scripts/ssh-vm.sh 'DISPLAY=:99 XAUTHORITY="$HOME/.Xauthority" xdotool key --clearmodifiers Escape'
 ```
 
-For a mouse-close test, explicitly allow Escape to dismiss obstructing menus while requiring a click on the actual browser title-bar X to close the window. Its title bar is below XFCE's top panel. A desktop image can remain unchanged during a long model call; the dashboard activity timer and controls should continue updating. A browser request timeout reports a dashboard/tunnel problem and does not itself stop the task or shorten the model's inference timeout.
+For a mouse-close test, explicitly allow Escape to dismiss obstructing menus while requiring a click on the actual browser title-bar X to close the window. Its title bar is below XFCE's top panel. The live feed shows desktop changes while the model is thinking; an unchanged screen can simply mean the desktop is idle. The dashboard activity timer and controls should continue updating. A browser request timeout reports a dashboard/tunnel problem and does not itself stop the task or shorten the model's inference timeout.
 
 For an immediate halt of **all** guest activity, power off the VM from the host. A normal shutdown is preferable when it is responsive:
 
@@ -177,7 +181,7 @@ Restoring a baseline discards later guest changes, including agent history and f
 
 ## Optional: view/control the same desktop over VNC
 
-The desktop is an Xvfb X11 session, so the VM's emulated console is not the agent's desktop. Use the dashboard for screenshots, or install the provided loopback-only VNC service **inside the guest**:
+The desktop is an Xvfb X11 session, so the VM's emulated console is not the agent's desktop. The dashboard already provides live viewing. For manual mouse/keyboard input, install the provided loopback-only VNC service **inside the guest**:
 
 ```bash
 bash ~/treics-agent/scripts/install-vnc.sh

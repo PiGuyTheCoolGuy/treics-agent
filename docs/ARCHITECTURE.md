@@ -55,6 +55,12 @@ The dashboard uses a bearer token, rejects cross-origin requests, and requires a
 
 Desktop operations use their own operation lock. Cached frame metadata, preview bytes, and last-click data use a separate, short-lived state lock. Dashboard status and image reads never wait for an X11 action or capture. Status releases the agent's control lock before reading desktop state, so a stalled operation cannot block Pause/Resume/Stop through polling. Manual preview capture similarly releases the control lock and sets a preview flag that excludes new tasks until the capture returns. Browser dashboard requests abort after ten seconds (twenty for manual capture), covering response bodies as well as headers; polling recovers on the next interval. These limits do not change the model request timeout.
 
+Live viewing uses authenticated `GET /api/desktop/stream`, with a multipart JPEG body consumed by fetch using the Authorization header. Tokens never enter stream URLs. One independent helper grabs the full X11 desktop through Pillow/XCB and composites the pointer through XFIXES when available. It resizes within the configured image budget, encodes at `stream_fps`/`stream_quality`, and sends bounded frames to a shared producer. This path never calls `Desktop.capture`, touches its model frame/image, acquires its GUI lock, hides its marker, or requests inference. Native marker pixels are visible in the feed; the canvas adds a last-click fallback if the marker is unavailable.
+
+Up to four viewers share the producer's latest frame; intermediate frames are discarded for slower viewers. Capture starts on demand and stops after the last subscriber leaves. A stalled/partial worker frame has a five-second deadline and causes worker termination/retry; socket writes also time out after five seconds. Status heartbeat parts detect disconnects while capture is unavailable. Server shutdown wakes subscribers and closes the capture worker. Live frames remain in memory and do not grow run storage or model context.
+
+The browser's bounded multipart parser handles fragmented headers/bodies and limits frame size. A canvas displays decoded bitmaps and immediately releases them. Stream reads use a separate watchdog and reconnect after failure. Pausing the live view, logging out, or hiding the tab cancels its connection; visibility/resume starts it again. Status polling and task controls use their own requests. Cached manual capture remains available with the feed paused and no active task. The stream JS is packaged with the controller and served locally.
+
 Polling retains existing activity-log DOM rows by event ID, preserving open Details panels and their internal scroll positions. New events append, expired events are removed, and selecting another run resets the list. Auto-scrolling is suspended while any Details panel is open. Checklist status appears separately from the event log.
 
 The guest has passwordless sudo to allow full control of its own OS. There are no shared host folders, host terminal tools, host credentials, or Docker socket mounts. Host firewall rules match only `virbr-treic` and leave other bridges alone. The gateway admits only selected models and chat/show/tags/version endpoints; it removes arbitrary model options, caps resource settings, and serializes inference. Disconnecting a cancelled request closes the upstream connection.
@@ -69,7 +75,7 @@ Repeated errors are tracked separately: three matching action/error messages wit
 
 ## Local development
 
-The controller requires Python 3.11+, Pillow, and python-xlib. The desktop tools are `scrot`, `xdotool` and `xclip`. The click-through live marker uses the SHAPE 1.1 extension provided by Xvfb. Linux X11 is required; this implementation does not control Windows or Wayland.
+The controller requires Python 3.11+, Pillow (with XCB support for native live capture), and python-xlib. The desktop tools are `scrot`, `xdotool` and `xclip`. The click-through live marker uses the SHAPE 1.1 extension provided by Xvfb; live pointer capture uses XFIXES. Linux X11 is required; this implementation does not control Windows or Wayland.
 
 ```bash
 python3 -m venv .venv

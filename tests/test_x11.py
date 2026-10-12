@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import os
 import secrets
 import selectors
@@ -17,6 +18,7 @@ from PIL import Image, ImageChops
 
 from treics_agent.config import Config
 from treics_agent.storage import Store
+from treics_agent.stream import DesktopStream
 from treics_agent.tools import Desktop, Tools
 
 
@@ -48,7 +50,7 @@ class X11Tests(unittest.TestCase):
             xvfb = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "800x600x24",
                                      *transports, "-auth", str(authority)],
                                     stdout=subprocess.PIPE, stderr=log)
-            desktop = store = client = None
+            desktop = store = client = live = None
             try:
                 with selectors.DefaultSelector() as selector:
                     selector.register(xvfb.stdout, selectors.EVENT_READ)
@@ -113,7 +115,40 @@ class X11Tests(unittest.TestCase):
                 client.sync()
                 remaining = {child.id for child in screen.root.query_tree().children}
                 self.assertTrue(marker_ids.isdisjoint(remaining))
+                # Live capture is independent of the model's cached image and GUI lock.
+                saved_frame, saved_preview = desktop.frame, desktop.image
+                live = DesktopStream(cfg)
+                live.subscribe()
+                first = live.next_frame(0, 3)
+                self.assertIsNotNone(first, live.snapshot())
+                self.assertEqual((first.width, first.height, first.desktop_width, first.desktop_height),
+                                 (800, 600, 800, 600))
+                red = screen.default_colormap.alloc_named_color("#ef2020").pixel
+                window.change_attributes(background_pixel=red)
+                window.clear_area(0, 0, 800, 600)
+                client.sync()
+                latest = first
+                for _ in range(12):
+                    latest = live.next_frame(latest.sequence, 1)
+                    self.assertIsNotNone(latest, live.snapshot())
+                    with Image.open(io.BytesIO(latest.jpeg)) as picture:
+                        r, g, b = picture.getpixel((50, 50))
+                    if r > g + 100:
+                        break
+                self.assertGreater(r, g + 100, "Live frames did not update when the desktop changed")
+                with Image.open(io.BytesIO(latest.jpeg)) as picture:
+                    pointer = picture.crop((390, 280, 440, 330))
+                    self.assertGreater(pointer.getextrema()[1][1], 120,
+                                       "The live stream did not include the mouse pointer")
+                self.assertIs(desktop.frame, saved_frame)
+                self.assertEqual(desktop.image, saved_preview)
+                self.assertEqual(client.get_input_focus().focus.id, window.id)
+                live.unsubscribe()
+                live.close()
+                self.assertIsNone(live.process)
             finally:
+                if live:
+                    live.close()
                 if desktop:
                     desktop.marker.close()
                 if client:

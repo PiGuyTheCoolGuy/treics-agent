@@ -23,6 +23,8 @@ class Config:
     xauthority: str = "~/.Xauthority"
     screen_width: int = 1024
     screen_height: int = 768
+    stream_fps: int = 5
+    stream_quality: int = 70
     work_dir: str = "~/agent-workspace"
     data_dir: str = "~/.local/share/treics-agent"
     max_steps: int = 100
@@ -40,6 +42,7 @@ class Config:
             "num_thread": (1, 256), "num_ctx": (4096, 65536),
             "num_predict": (128, 8192), "request_timeout": (10, 3600),
             "screen_width": (320, 1920), "screen_height": (240, 1200),
+            "stream_fps": (1, 15), "stream_quality": (30, 95),
             "max_steps": (1, 10000), "max_run_minutes": (1, 1440),
             "shell_timeout": (1, 600), "history_steps": (1, 20), "port": (1024, 65535),
         }

@@ -26,9 +26,15 @@ def in_vm() -> bool:
 
 
 def doctor(cfg: Config, test_model: bool = False) -> int:
+    from PIL import features
+
     problems = []
     print(f"Configuration: {config_path()}\nModel: {cfg.model}\nOllama: {cfg.ollama_url}\nDesktop: {cfg.display}")
     print("Virtual machine:", "yes" if in_vm() else "not detected")
+    native_capture = features.check_feature("xcb")
+    print("Live desktop X11 capture:", "available" if native_capture else "unavailable")
+    if not native_capture:
+        problems.append("Pillow lacks native X11 capture. Install its Linux wheel for live desktop streaming.")
     for command in ("xdotool", "scrot", "xclip", "Xvfb", "dbus-run-session", cfg.browser):
         found = shutil.which(command)
         print(f"{command}: {found or 'MISSING'}")

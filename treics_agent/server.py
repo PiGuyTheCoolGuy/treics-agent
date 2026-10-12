@@ -8,6 +8,7 @@ from importlib.resources import files
 from urllib.parse import urlsplit
 
 from .agent import Agent
+from .stream import BOUNDARY, DesktopStream
 
 
 class AgentHTTPServer(ThreadingHTTPServer):
@@ -18,7 +19,12 @@ class AgentHTTPServer(ThreadingHTTPServer):
         if len(agent.config.dashboard_token) < 24 or "REPLACE_" in agent.config.dashboard_token:
             raise ValueError("Set a random dashboard_token of at least 24 characters before serving.")
         self.agent = agent
+        self.desktop_stream = DesktopStream(agent.config)
         super().__init__(address, Handler)
+
+    def server_close(self) -> None:
+        self.desktop_stream.close()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -62,16 +68,66 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def stream_desktop(self) -> None:
+        stream = self.server.desktop_stream
+        try:
+            stream.subscribe()
+        except (ValueError, RuntimeError) as exc:
+            self.send(429 if isinstance(exc, ValueError) else 503, {"error": str(exc)})
+            return
+        try:
+            self.connection.settimeout(5)
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=" + BOUNDARY)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            sequence = 0
+            while not stream.closed:
+                frame = stream.next_frame(sequence)
+                if stream.closed:
+                    break
+                if frame:
+                    sequence = frame.sequence
+                    body = frame.jpeg
+                    content_type = "image/jpeg"
+                    metadata = (f"X-Desktop-Width: {frame.desktop_width}\r\n"
+                                f"X-Desktop-Height: {frame.desktop_height}\r\n"
+                                f"X-Captured-At: {frame.captured_at}\r\n"
+                                f"X-Frame-Rate: {stream.config.stream_fps}\r\n")
+                else:
+                    # A heartbeat also detects disconnected viewers while capture retries.
+                    body = json.dumps({"message": stream.snapshot()["error"] or "Connecting to desktop…"}).encode()
+                    content_type, metadata = "application/json", ""
+                header = (f"--{BOUNDARY}\r\nContent-Type: {content_type}\r\n"
+                          f"Content-Length: {len(body)}\r\n{metadata}\r\n").encode()
+                self.wfile.write(header)
+                self.wfile.write(body)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            stream.unsubscribe()
+
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/":
             self.send(200, files("treics_agent").joinpath("static/index.html").read_bytes(), "text/html; charset=utf-8")
             return
+        if path == "/assets/desktop-stream.js":
+            self.send(200, files("treics_agent").joinpath("static/desktop-stream.js").read_bytes(),
+                      "application/javascript; charset=utf-8")
+            return
         if not self.authorized():
             return
         agent = self.server.agent
         if path == "/api/state":
-            self.send(200, agent.snapshot())
+            self.send(200, {**agent.snapshot(), "desktop_stream": self.server.desktop_stream.snapshot()})
+        elif path == "/api/desktop/stream":
+            self.stream_desktop()
         elif match := re.fullmatch(r"/api/runs/([a-f0-9]{32})", path):
             run_id = match.group(1)
             run = agent.store.run(run_id)

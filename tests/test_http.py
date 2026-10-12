@@ -19,6 +19,7 @@ from treics_agent.server import AgentHTTPServer
 from treics_agent.storage import Store
 from treics_agent.tools import Tools
 from test_agent import FakeDesktop, FakeModel, decision
+from test_stream import frame_worker_script, worker_stub
 
 
 def script_module(name):
@@ -123,6 +124,12 @@ class HTTPTests(unittest.TestCase):
         status, html = request(self.api, "/")
         self.assertEqual(status, 200)
         self.assertIn(b"Treic's Agent", html)
+        self.assertIn(b"/assets/desktop-stream.js", html)
+        self.assertEqual(request(self.api, "/assets/desktop-stream.js")[0], 200)
+        self.assertEqual(request(self.api, "/api/desktop/stream")[0], 401)
+        self.assertIsNone(self.api.desktop_stream.thread, "Unauthenticated viewing started capture")
+        self.assertEqual(request(self.api, "/api/desktop/stream", token=self.cfg.dashboard_token,
+                                 extra={"Origin": "https://attacker.example"})[0], 403)
         self.assertEqual(request(self.api, "/api/state")[0], 401)
         self.assertEqual(request(self.api, "/api/state", token="bad")[0], 401)
         status, body = request(self.api, "/api/state", token=self.cfg.dashboard_token)
@@ -206,6 +213,71 @@ class HTTPTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(results[0][0], 200)
         self.assertFalse(self.agent.snapshot()["previewing"])
+
+    def test_authenticated_live_frames_share_capture_and_do_not_block_task_controls(self):
+        self.desktop.capture()
+        model_frame, model_image = self.desktop.frame, self.desktop.image
+        stream = self.api.desktop_stream
+        workers, viewers = [], []
+        held, release = threading.Event(), threading.Event()
+        def block_desktop():
+            with self.desktop.lock:
+                held.set()
+                release.wait(5)
+        blocker = threading.Thread(target=block_desktop)
+        def read_frame(response):
+            line = response.readline(8192)
+            while not line.strip():
+                line = response.readline(8192)
+            self.assertEqual(line.strip(), b"--treic-frame")
+            headers = {}
+            while (line := response.readline(8192)).strip():
+                key, value = line.decode().split(":", 1)
+                headers[key.lower()] = value.strip()
+            return headers, response.read(int(headers["content-length"]))
+        try:
+            with worker_stub(frame_worker_script(), workers):
+                for _ in range(2):
+                    connection = http.client.HTTPConnection(*self.api.server_address, timeout=2)
+                    connection.request("GET", "/api/desktop/stream", headers={"Authorization": "Bearer " + self.cfg.dashboard_token})
+                    response = connection.getresponse()
+                    viewers.append((connection, response))
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("multipart/x-mixed-replace", response.getheader("Content-Type"))
+                    headers, body = read_frame(response)
+                    self.assertEqual(headers["content-type"], "image/jpeg")
+                    self.assertEqual(headers["x-desktop-width"], "800")
+                    self.assertTrue(body.startswith(b"\xff\xd8"))
+                self.assertEqual(len(workers), 1)
+                self.assertIs(self.desktop.frame, model_frame)
+                self.assertEqual(self.desktop.image, model_image)
+                blocker.start()
+                self.assertTrue(held.wait(1))
+                run_id = self.agent.start("Stop during independent desktop streaming")
+                self.assertEqual(request(self.api, "/api/state", token=self.cfg.dashboard_token, timeout=1)[0], 200)
+                self.assertEqual(request(self.api, "/api/stop", "POST", {}, self.cfg.dashboard_token,
+                                         {"X-Treic-Agent": "1"}, timeout=1)[0], 200)
+                self.assertEqual(read_frame(viewers[0][1])[0]["content-type"], "image/jpeg")
+                self.assertIsNone(workers[0].poll(), "Stopping the task stopped the live view")
+                self.assertIs(self.desktop.frame, model_frame)
+                release.set()
+                blocker.join(2)
+                self.agent.thread.join(3)
+                self.assertEqual(self.store.run(run_id)["status"], "stopped")
+                for connection, response in viewers:
+                    response.close(); connection.close()
+                viewers.clear()
+                deadline = time.monotonic() + 3
+                while stream.snapshot()["viewers"] and time.monotonic() < deadline:
+                    threading.Event().wait(0.02)
+                self.assertEqual(stream.snapshot()["viewers"], 0)
+        finally:
+            release.set()
+            if blocker.ident is not None:
+                blocker.join(2)
+            for connection, response in viewers:
+                response.close(); connection.close()
+            stream.close()
 
     def test_proxy_restricts_management_model_and_resource_parameters(self):
         self.assertEqual(request(self.proxy, "/api/version")[0], 401)

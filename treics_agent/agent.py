@@ -30,6 +30,7 @@ class Agent:
         self.pause_reason: str | None = None
         self.thread: threading.Thread | None = None
         self.current: str | None = None
+        self.previewing = False
         self.phase = "idle"
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
@@ -42,14 +43,27 @@ class Agent:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"current": self.store.run(self.current) if self.current else None,
+            result = {"current": self.store.run(self.current) if self.current else None,
                     "phase": self.phase, "phase_started": self.phase_started,
                     "last_model_seconds": self.last_model_seconds,
                     "pause_reason": self.pause_reason,
                     "task_checklist": self.config.task_checklist,
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
                     "workspace": str(self.config.work_path), "runs": self.store.runs(),
-                    **self.tools.desktop.snapshot()}
+                    "previewing": self.previewing}
+        # Never hold the control lock while consulting desktop state.
+        return {**result, **self.tools.desktop.snapshot()}
+
+    def capture_preview(self) -> dict:
+        with self.lock:
+            if self.previewing or (self.thread and self.thread.is_alive()):
+                raise ValueError("Desktop capture is already active or updates automatically during a run.")
+            self.previewing = True
+        try:
+            return self.tools.desktop.capture()
+        finally:
+            with self.lock:
+                self.previewing = False
 
     def start(self, task: str, max_steps: int | None = None) -> str:
         if not isinstance(task, str) or not task.strip() or len(task) > 12000:
@@ -58,6 +72,8 @@ class Agent:
         if type(max_steps) is not int or not 1 <= max_steps <= 10000:
             raise ValueError("max_steps must be an integer from 1 to 10000.")
         with self.lock:
+            if self.previewing:
+                raise ValueError("A desktop preview is being captured. Try starting the task again shortly.")
             if self.thread and self.thread.is_alive():
                 raise ValueError("A task is already active. Stop it before starting another.")
             self.stop_event.clear()
@@ -221,7 +237,7 @@ class Agent:
                     else:
                         screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
-                        self.tools.desktop.frame = None
+                        self.tools.desktop.invalidate_frame()
                     reason = progress.observe(decision, result, previous_screen, screen)
                     if reason and step < run["max_steps"]:
                         self._pause_stalled(run_id, step, reason, deadline)
@@ -248,7 +264,7 @@ class Agent:
                                          {"items": checklist.snapshot(), "message": "Recorded unsuccessful attempt."})
                     if isinstance(exc, (ToolError, OSError)):
                         screen = None
-                        self.tools.desktop.frame = None
+                        self.tools.desktop.invalidate_frame()
                     reason = progress.error(decision, message)
                     if reason and step < run["max_steps"]:
                         self._pause_stalled(run_id, step, reason, deadline)

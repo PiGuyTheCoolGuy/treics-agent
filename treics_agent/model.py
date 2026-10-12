@@ -128,6 +128,11 @@ image for click/move/drag/scroll; never add screen.source offsets or divide by z
 Nested zooms also use the latest image's local coordinates. screenshot restores the full view.
 After any ordinary GUI action the next image is full desktop again; use its new coordinates.
 Prefer hotkey ["alt","F4"] to close the active window, and other reliable keyboard shortcuts.
+XFCE's top panel has an "agent" account menu; it is not a window's close button. Locate
+the X on the actual window title bar, which may be below that panel. If a popup covers
+the target or an unexpected menu opens after a click, dismiss it with press Escape first,
+then inspect the fresh screenshot and zoom the intended control. Do not reuse obscured
+or previous-image coordinates. Escape dismisses a menu; it does not close the browser.
 The human desktop preview marks the last executed click. That marker is excluded from your image.
 Coordinates are separate integer x and y fields, never an array. Use literal image pixels,
 not a normalized 0-1000 scale. x must be less than screen.width; y less than screen.height.

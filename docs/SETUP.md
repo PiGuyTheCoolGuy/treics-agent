@@ -138,7 +138,15 @@ git pull --ff-only
 bash scripts/ssh-vm.sh 'systemctl --user stop treics-agent && cd ~/treics-agent && git pull --ff-only && bash scripts/install-guest.sh --skip-apt && systemctl --user restart treics-agent'
 ```
 
-The installer refreshes Python dependencies (including python-xlib for the live last-click marker) and preserves the existing configuration. No desktop rebuild or model download is needed for the zoom/marker update. Refresh the dashboard after restarting. The full-desktop preview shows the last click in red even while the model examines a zoomed crop; a caption reports that crop's location and dimensions. If the live marker cannot connect to X11, the preview still marks clicks and the dashboard reports the live-marker error.
+The installer refreshes Python dependencies (including python-xlib for the live last-click marker) and preserves the existing configuration. No desktop rebuild or model download is needed for the zoom/marker update. Refresh the dashboard after restarting. The full-desktop preview shows the last click in red even while the model examines a zoomed crop; a caption reports that crop's location and dimensions. If the live marker cannot connect to X11 or takes longer than three seconds to respond, its helper is stopped, the preview still marks clicks, and the dashboard reports the live-marker error. Dashboard status and controls use cached desktop state and remain available during a stalled desktop operation.
+
+If the agent accidentally opens XFCE's top-right `agent` menu over the browser's close button, dismiss it from **treicserver**:
+
+```bash
+bash scripts/ssh-vm.sh 'DISPLAY=:99 XAUTHORITY="$HOME/.Xauthority" xdotool key --clearmodifiers Escape'
+```
+
+For a mouse-close test, explicitly allow Escape to dismiss obstructing menus while requiring a click on the actual browser title-bar X to close the window. Its title bar is below XFCE's top panel. A desktop image can remain unchanged during a long model call; the dashboard activity timer and controls should continue updating. A browser request timeout reports a dashboard/tunnel problem and does not itself stop the task or shorten the model's inference timeout.
 
 For an immediate halt of **all** guest activity, power off the VM from the host. A normal shutdown is preferable when it is responsive:
 

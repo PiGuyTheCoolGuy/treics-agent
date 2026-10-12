@@ -81,7 +81,8 @@ class X11Tests(unittest.TestCase):
                 self.assertEqual((result["last_click"]["x"], result["last_click"]["y"]), (400, 300))
                 self.assertEqual(client.get_input_focus().focus.id, window.id)
                 self.assertTrue(desktop.marker.visible)
-                for layer in desktop.marker.windows:
+                for window_id in desktop.marker.window_ids:
+                    layer = client.create_resource_object("window", window_id)
                     self.assertEqual(list(layer.shape_get_rectangles(shape.SK.Input).rectangles), [])
                 marked = root / "marked.png"
                 desktop.command(["scrot", "-o", str(marked)])
@@ -107,7 +108,7 @@ class X11Tests(unittest.TestCase):
                     self.assertIsNotNone(bbox, "The live marker was not drawn")
                     self.assertGreaterEqual(bbox[0], 379)
                     self.assertLessEqual(bbox[2], 422)
-                marker_ids = {layer.id for layer in desktop.marker.windows}
+                marker_ids = set(desktop.marker.window_ids)
                 desktop.marker.close()
                 client.sync()
                 remaining = {child.id for child in screen.root.query_tree().children}

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,18 +34,18 @@ vm_module = script_module("vm-config")
 diagnostic_module = script_module("diagnose-model")
 
 
-def request(server, path, method="GET", body=None, token=None, extra=None):
-    connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+def request(server, path, method="GET", body=None, token=None, extra=None, timeout=3):
+    connection = http.client.HTTPConnection(*server.server_address, timeout=timeout)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     headers.update(extra or {})
-    connection.request(method, path, json.dumps(body) if body is not None else None, headers)
-    response = connection.getresponse()
-    data = response.read()
-    status = response.status
-    connection.close()
-    return status, data
+    try:
+        connection.request(method, path, json.dumps(body) if body is not None else None, headers)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
 
 
 class FakeOllama(BaseHTTPRequestHandler):
@@ -139,6 +140,72 @@ class HTTPTests(unittest.TestCase):
         status, body = request(self.api, "/api/runs/" + run_id, token=self.cfg.dashboard_token)
         self.assertEqual(json.loads(body)["run"]["status"], "completed")
         self.assertEqual(request(self.api, "/api/screen", token=self.cfg.dashboard_token)[0], 200)
+
+    def test_status_cached_screen_and_controls_respond_while_desktop_is_locked(self):
+        self.desktop.capture()
+        image = self.desktop.image
+        held, release = threading.Event(), threading.Event()
+        def block_desktop():
+            with self.desktop.lock:
+                held.set()
+                release.wait(5)
+        worker = threading.Thread(target=block_desktop)
+        worker.start()
+        self.assertTrue(held.wait(1))
+        try:
+            run_id = self.agent.start("Test responsive controls during stalled capture")
+            status, body = request(self.api, "/api/state", token=self.cfg.dashboard_token, timeout=1)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["current"]["id"], run_id)
+            self.assertEqual(request(self.api, "/api/screen", token=self.cfg.dashboard_token, timeout=1),
+                             (200, image))
+            for action in ("pause", "resume", "stop"):
+                self.assertEqual(request(self.api, "/api/" + action, "POST", {}, self.cfg.dashboard_token,
+                                         {"X-Treic-Agent": "1"}, timeout=1)[0], 200)
+            self.assertFalse(release.is_set(), "Controls needed the desktop operation to return")
+            self.assertTrue(self.agent.stop_event.is_set())
+        finally:
+            release.set()
+            worker.join(2)
+            if self.agent.thread:
+                self.agent.thread.join(3)
+        self.assertEqual(self.store.run(run_id)["status"], "stopped")
+
+    def test_manual_preview_keeps_status_responsive_and_excludes_new_tasks(self):
+        self.desktop.capture()
+        entered, release = threading.Event(), threading.Event()
+        original = self.desktop.command
+        def blocked_capture(args, **kwargs):
+            if args[0] == "scrot":
+                entered.set()
+                release.wait(5)
+            return original(args, **kwargs)
+        results = []
+        def preview():
+            results.append(request(self.api, "/api/preview", "POST", {}, self.cfg.dashboard_token,
+                                   {"X-Treic-Agent": "1"}))
+        with mock.patch.object(self.desktop, "command", side_effect=blocked_capture):
+            worker = threading.Thread(target=preview)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                status, body = request(self.api, "/api/state", token=self.cfg.dashboard_token, timeout=1)
+                self.assertEqual(status, 200)
+                self.assertTrue(json.loads(body)["previewing"])
+                self.assertEqual(request(self.api, "/api/screen", token=self.cfg.dashboard_token, timeout=1)[0], 200)
+                controls = {"X-Treic-Agent": "1"}
+                self.assertEqual(request(self.api, "/api/start", "POST", {"task": "Must not race preview"},
+                                         self.cfg.dashboard_token, controls, timeout=1)[0], 400)
+                self.assertEqual(request(self.api, "/api/preview", "POST", {}, self.cfg.dashboard_token,
+                                         controls, timeout=1)[0], 400)
+                self.assertEqual(request(self.api, "/api/stop", "POST", {}, self.cfg.dashboard_token,
+                                         controls, timeout=1)[0], 200)
+            finally:
+                release.set()
+                worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0][0], 200)
+        self.assertFalse(self.agent.snapshot()["previewing"])
 
     def test_proxy_restricts_management_model_and_resource_parameters(self):
         self.assertEqual(request(self.proxy, "/api/version")[0], 401)

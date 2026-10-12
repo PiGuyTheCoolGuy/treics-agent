@@ -78,8 +78,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200 if run else 404, {"run": run, "events": agent.store.events(run_id, 300)} if run
                       else {"error": "Run not found."})
         elif path == "/api/screen":
-            with agent.tools.desktop.lock:
-                image = agent.tools.desktop.image
+            image = agent.tools.desktop.preview_image()
             if image:
                 self.send(200, image, "image/jpeg")
             else:
@@ -113,10 +112,7 @@ class Handler(BaseHTTPRequestHandler):
                 getattr(agent, path.rsplit("/", 1)[1])()
                 self.send(200, {"ok": True})
             elif path == "/api/preview":
-                with agent.lock:
-                    if agent.thread and agent.thread.is_alive():
-                        raise ValueError("Desktop capture updates automatically during a run.")
-                    frame = agent.tools.desktop.capture()
+                frame = agent.capture_preview()
                 self.send(200, {k: v for k, v in frame.items() if k != "base64"})
             elif path == "/api/memory":
                 agent.store.remember(payload.get("text"))

@@ -1,15 +1,119 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import os
+import selectors
+import subprocess
+import sys
 import threading
+import time
 
 from .config import Config
 
-_AUTH_LOCK = threading.Lock()
-
 
 class ClickMarker:
+    """Bound X11 marker work in a disposable helper process."""
+
+    TIMEOUT = 3.0
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.lock = threading.RLock()
+        self.process_lock = threading.Lock()
+        self.pending = threading.Event()
+        self.process: subprocess.Popen | None = None
+        self.visible = False
+        self.window_ids: list[int] = []
+
+    def request(self, action: str, **arguments) -> None:
+        with self.lock:
+            self.pending.set()
+            try:
+                with self.process_lock:
+                    if self.process is None:
+                        self.process = subprocess.Popen(
+                            [sys.executable, "-m", "treics_agent.click_marker", "--worker"],
+                            env=self.config.desktop_env(), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+                    process = self.process
+                deadline = time.monotonic() + self.TIMEOUT
+                process.stdin.write((json.dumps({"action": action, **arguments}) + "\n").encode())
+                process.stdin.flush()
+                output = bytearray()
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while b"\n" not in output:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not selector.select(remaining):
+                            raise TimeoutError("Live click marker timed out; the dashboard preview still marks clicks.")
+                        chunk = os.read(process.stdout.fileno(), 4096)
+                        if not chunk:
+                            raise RuntimeError("Live click marker worker exited before responding.")
+                        output.extend(chunk)
+                        if len(output) > 4096:
+                            raise RuntimeError("Unexpected live click marker response.")
+                response = json.loads(output)
+                if response.get("error"):
+                    raise RuntimeError(response["error"])
+                self.visible = response["visible"]
+                self.window_ids = response["window_ids"]
+            except Exception:
+                self.close()
+                raise
+            finally:
+                self.pending.clear()
+
+    def show(self, x: int, y: int) -> None:
+        self.request("show", x=x, y=y)
+
+    @contextmanager
+    def hidden(self):
+        restore = self.visible
+        if restore:
+            try:
+                self.request("hide")
+            except Exception:
+                # Closing the worker destroys its windows, leaving a clean capture.
+                restore = False
+        try:
+            yield
+        finally:
+            if restore and self.process is not None:
+                try:
+                    self.request("restore")
+                except Exception:
+                    pass
+
+    def cancel(self, force: bool = False) -> None:
+        # Stop must not wait for the request lock held by a stalled X11 call.
+        with self.process_lock:
+            process = self.process
+            if process is not None and (force or self.pending.is_set()):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+
+    def close(self) -> None:
+        self.cancel(force=True)
+        with self.lock, self.process_lock:
+            process, self.process = self.process, None
+            self.visible = False
+            self.window_ids = []
+            if process is not None:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                for pipe in (process.stdin, process.stdout):
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+
+
+class NativeClickMarker:
     """Small shaped X11 windows with empty input regions; never take focus."""
 
     RADIUS = 20
@@ -29,18 +133,8 @@ class ClickMarker:
         from Xlib import X, display
         from Xlib.ext import shape
 
-        # python-xlib reads XAUTHORITY from the process environment at connect time.
-        # All desktop subprocesses already pass their own explicit environment.
-        with _AUTH_LOCK:
-            previous = os.environ.get("XAUTHORITY")
-            os.environ["XAUTHORITY"] = self.config.desktop_env()["XAUTHORITY"]
-            try:
-                connection = display.Display(self.config.display)
-            finally:
-                if previous is None:
-                    os.environ.pop("XAUTHORITY", None)
-                else:
-                    os.environ["XAUTHORITY"] = previous
+        # This worker already inherited the explicit desktop environment.
+        connection = display.Display(self.config.display)
         self.display = connection
         if not connection.has_extension("SHAPE"):
             raise RuntimeError("The desktop does not support the X11 SHAPE extension.")
@@ -71,35 +165,22 @@ class ClickMarker:
         self.display.sync()
         self.visible = True
 
-    @contextmanager
-    def hidden(self):
-        """Keep the marker out of the pixels sent to the model."""
-        visible = self.visible
-        if visible:
-            try:
-                for window in self.windows:
-                    window.unmap()
-                self.display.sync()
-                # Give a composited XFCE desktop a frame to repaint beneath it.
-                import time
+    def hide(self) -> None:
+        for window in self.windows:
+            window.unmap()
+        self.display.sync()
+        self.visible = False
+        # Give a composited XFCE desktop a frame to repaint beneath it.
+        time.sleep(0.05)
 
-                time.sleep(0.05)
-            except Exception:
-                self.close()
-                visible = False
-        try:
-            yield
-        finally:
-            if visible:
-                from Xlib import X
+    def restore(self) -> None:
+        from Xlib import X
 
-                try:
-                    for window in self.windows:
-                        window.map()
-                        window.configure(stack_mode=X.Above)
-                    self.display.sync()
-                except Exception:
-                    self.close()
+        for window in self.windows:
+            window.map()
+            window.configure(stack_mode=X.Above)
+        self.display.sync()
+        self.visible = True
 
     def close(self) -> None:
         connection, self.display = self.display, None
@@ -110,3 +191,33 @@ class ClickMarker:
                 connection.close()  # X11 destroys all windows owned by this connection.
             except Exception:
                 pass  # The X server may already have exited.
+
+
+def run_worker() -> None:
+    marker = NativeClickMarker(Config(display=os.environ["DISPLAY"], xauthority=os.environ["XAUTHORITY"]))
+    try:
+        for line in sys.stdin:
+            try:
+                command = json.loads(line)
+                action = command["action"]
+                if action == "show":
+                    marker.show(command["x"], command["y"])
+                elif action == "hide":
+                    marker.hide()
+                elif action == "restore":
+                    marker.restore()
+                else:
+                    raise ValueError("Unknown click marker action.")
+                print(json.dumps({"visible": marker.visible,
+                                  "window_ids": [window.id for window in marker.windows]}), flush=True)
+            except Exception as exc:
+                print(json.dumps({"error": str(exc)[:300]}), flush=True)
+                return
+    finally:
+        marker.close()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--worker"]:
+        raise SystemExit("This module is an internal desktop marker worker.")
+    run_worker()

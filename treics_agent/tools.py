@@ -42,7 +42,9 @@ def text(value, name: str, maximum: int = 100000) -> str:
 class Desktop:
     def __init__(self, config: Config):
         self.config = config
+        # GUI operations may wait on X11. Publishing/reading cached state must not.
         self.lock = threading.RLock()
+        self.state_lock = threading.RLock()
         self.frame: dict | None = None
         self.image: bytes | None = None
         self.run_directory: Path | None = None
@@ -89,16 +91,20 @@ class Desktop:
                 "desktop_height": frame["desktop_height"]}
 
     def record_click(self, x: int, y: int, button: str, clicks: int, source: dict) -> dict:
-        self.last_click = {"x": x, "y": y, "button": button, "clicks": clicks,
-                           "clicked_at": time.time(), "source": source}
+        click = {"x": x, "y": y, "button": button, "clicks": clicks,
+                 "clicked_at": time.time(), "source": source}
+        with self.state_lock:
+            self.last_click = click
         try:
             self.marker.show(x, y)
-            self.marker_error = None
+            error = None
         except Exception as exc:
             # Drawing failure must never turn a completed click into a retry.
-            self.marker_error = str(exc)[:300]
+            error = str(exc)[:300]
             self.marker.close()
-        return dict(self.last_click)
+        with self.state_lock:
+            self.marker_error = error
+        return dict(click)
 
     def pointer_coordinates(self) -> tuple[int, int]:
         location = self.command(["xdotool", "getmouselocation", "--shell"])
@@ -114,10 +120,18 @@ class Desktop:
             self.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
 
     def snapshot(self) -> dict:
-        with self.lock:
+        with self.state_lock:
             return {"last_click": dict(self.last_click) if self.last_click else None,
                     "click_marker_error": self.marker_error,
                     "screen": {k: v for k, v in self.frame.items() if k != "base64"} if self.frame else None}
+
+    def preview_image(self) -> bytes | None:
+        with self.state_lock:
+            return self.image
+
+    def invalidate_frame(self) -> None:
+        with self.state_lock:
+            self.frame = None
 
     def capture(self, region: dict | None = None) -> dict:
         from PIL import Image, ImageDraw
@@ -133,7 +147,7 @@ class Desktop:
                 view = image
                 if region:
                     if (screen_width, screen_height) != (region["desktop_width"], region["desktop_height"]):
-                        self.frame = None
+                        self.invalidate_frame()
                         raise ToolError("Desktop resolution changed. Use screenshot before zooming again.")
                     source = {key: region[key] for key in ("x", "y", "width", "height")}
                     view = image.crop((source["x"], source["y"], source["x"] + source["width"],
@@ -157,11 +171,14 @@ class Desktop:
                                  (cx, cy - 20, cx, cy - 14), (cx, cy + 14, cx, cy + 20)):
                         draw.line(line, fill="white", width=4)
                         draw.line(line, fill="#ff4040", width=2)
-                self.image = self.jpeg(image)
-                self.frame = {"width": view.width, "height": view.height,
-                              "desktop_width": screen_width, "desktop_height": screen_height,
-                              "view": "zoom" if region else "desktop", "source": source,
-                              "captured_at": time.time(), "base64": base64.b64encode(self.jpeg(view)).decode()}
+                preview = self.jpeg(image)
+                frame = {"width": view.width, "height": view.height,
+                         "desktop_width": screen_width, "desktop_height": screen_height,
+                         "view": "zoom" if region else "desktop", "source": source,
+                         "captured_at": time.time(), "base64": base64.b64encode(self.jpeg(view)).decode()}
+                with self.state_lock:
+                    self.image = preview
+                    self.frame = frame
             if self.run_directory:
                 self.run_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 temporary = self.run_directory / "screen.tmp"
@@ -232,6 +249,7 @@ class Tools:
         with self.process_lock:
             if self.process:
                 self.kill(self.process)
+        self.desktop.marker.cancel()
 
     def resolve(self, value) -> Path:
         path = Path(text(value, "path", 4096)).expanduser()

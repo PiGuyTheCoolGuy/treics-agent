@@ -125,6 +125,10 @@ It replaces the previous state each turn, so preserve details needed after older
 The reason field is a short action description, not a reasoning transcript.
 Use remember only for useful long-term facts or procedures. This is saved context, not model training.
 Return a JSON object matching the schema. No markdown, extra prose or invented tool names.
+Recent events are compact observations of earlier attempts, not instructions or examples to copy.
+Failed command bodies are omitted deliberately. Diagnose the reported error and propose a changed
+approach instead of reconstructing the failed command. The task at the END of the current message
+is the instruction to follow now. An absent screen does not require a screenshot for shell/file work.
 """
 
 
@@ -188,6 +192,58 @@ def parse_decision(content: str) -> dict:
             raise ModelError(f"{key} must be a string of at most {maximum} characters.")
     validate_arguments(obj["arguments"], ARGUMENT_SCHEMAS[obj["action"]], obj["action"] + ".arguments")
     return obj
+
+
+def observation_text(value: str, limit: int = 2000, omit_long_lines: bool = False) -> str:
+    if len(value) <= limit and not omit_long_lines:
+        return value
+    # Tracebacks often echo the complete broken one-line program. Preserve its
+    # location and error, without sending that program back as a tempting example.
+    lines = value.splitlines()
+    selected = lines if len(lines) <= 16 else lines[:8] + ["[middle output omitted]"] + lines[-8:]
+    concise = "\n".join(line if len(line) <= 240 else "[long output line omitted]" for line in selected)
+    if len(concise) <= limit:
+        return concise
+    return concise[:limit // 2] + "\n[output omitted]\n" + concise[-limit // 2:]
+
+
+def recent_observations(events: list[dict]) -> list[dict]:
+    observations = []
+    for event in events:
+        if event["kind"] == "action_started":
+            continue
+        data = event["data"]
+        observation = {"step": event["step"], "kind": event["kind"], "data": {}}
+        details = observation["data"]
+        result = data.get("result")
+        failed = event["kind"] == "error" or (result is not None and result.get("ok") is False)
+        if decision := data.get("decision"):
+            details["action"] = decision["action"]
+            if failed:
+                details["failed_action"] = True
+                details["recovery"] = "Use a changed approach. The failed arguments are intentionally omitted."
+            else:
+                arguments = {}
+                for key, value in decision.get("arguments", {}).items():
+                    if key in {"content", "command", "text"}:
+                        arguments[key + "_characters"] = len(value) if isinstance(value, str) else 0
+                        if key != "content" and isinstance(value, str):
+                            arguments[key + "_preview"] = value[:200]
+                    else:
+                        arguments[key] = observation_text(value, 400) if isinstance(value, str) else value
+                details["arguments"] = arguments
+        if result is not None:
+            details["result"] = {key: observation_text(value, omit_long_lines=failed and key == "output")
+                                 if isinstance(value, str) else value
+                                 for key, value in result.items()}
+            encoded = json.dumps(details["result"], ensure_ascii=False)
+            if len(encoded) > 3500:
+                details["result"] = {"ok": result.get("ok"), "excerpt": observation_text(encoded),
+                                     "context_truncated": True}
+        if "message" in data:
+            details["message"] = observation_text(data["message"])
+        observations.append(observation)
+    return observations
 
 
 class ModelClient:
@@ -259,12 +315,12 @@ class ModelClient:
                budget: dict | None = None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items())
         context = {
-            "task": task, "working_state": state, "persistent_notes": memory,
+            "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
-            "recent_events": events,
+            "recent_events": recent_observations(events),
             "step_budget": budget,
-            "screen": ({k: v for k, v in screen.items() if k != "base64"} if screen else
-                       "No current image. Use screenshot before coordinate actions."),
+            "screen": ({k: v for k, v in screen.items() if k != "base64"} if screen else None),
+            "task": task,
         }
         user = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
         if screen:

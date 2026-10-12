@@ -21,7 +21,9 @@ flowchart TD
 2. Validate the outer response and tool arguments. Invalid model text is never evaluated as Python or a shell command.
 3. Check pause, stop, and elapsed-time limits before executing the action.
 4. Execute the named tool, record the actual result, and capture a fresh screenshot after GUI work.
-5. Feed bounded recent results and the newest state into the next decision. A `finish` action ends the task.
+5. Feed compact observed results and the newest state into the next decision, with the current task last in the message. A `finish` action ends the task.
+
+Model context excludes historical reason/state claims and failed action arguments. Successful arguments retain paths and control parameters, short command/text previews, and file-content sizes. Results retain exit status, output, and error messages, with long traceback source lines omitted. The full original events remain in the database and dashboard. No-image context is represented by `null`, rather than another instruction to request a screenshot.
 
 For shell/file/note actions the next prompt omits images, and previous coordinates are invalidated. The model requests a screenshot before returning to coordinate actions. Screenshot coordinates are mapped to the actual desktop when the image is downscaled.
 

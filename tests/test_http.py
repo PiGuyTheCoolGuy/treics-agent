@@ -182,6 +182,33 @@ class HTTPTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelError, "type.arguments.paste_keys"):
             ModelClient(cfg).decide("Type", "", "", [], self.desktop.capture(), threading.Event())
 
+    def test_model_context_uses_observed_results_and_keeps_current_task_last(self):
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        failed_code = "class BrokenParser: " + "invalid syntax; " * 75
+        failed = decision("shell", {"command": failed_code}, "Falsely claimed the report was finished")
+        events = [{"step": 2, "kind": "action", "data": {"decision": failed,
+                  "result": {"ok": False, "exit_code": 1,
+                             "output": 'File "<string>", line 1\n' + failed_code + '\nSyntaxError: invalid syntax'}}},
+                  {"step": 3, "kind": "action", "data": {
+                      "decision": decision("write_file", {"path": "report.md", "content": "old report"}),
+                      "result": {"ok": True, "path": "report.md", "characters": 10}}}]
+        ModelClient(cfg).decide("Write a NEW script with real newlines", "Observed state", "", events,
+                                None, threading.Event())
+        message = self.upstream.payloads[-1]["messages"][1]
+        context = json.loads(message["content"])
+        self.assertEqual(list(context)[-1], "task")
+        self.assertIsNone(context["screen"])
+        self.assertNotIn(failed_code, message["content"])
+        self.assertNotIn("Falsely claimed", message["content"])
+        self.assertNotIn("old report", message["content"])
+        first = context["recent_events"][0]["data"]
+        self.assertTrue(first["failed_action"])
+        self.assertIn("SyntaxError: invalid syntax", first["result"]["output"])
+        self.assertEqual(context["recent_events"][1]["data"]["arguments"]["path"], "report.md")
+        # The full evidence stays intact in the original events / database.
+        self.assertEqual(events[0]["data"]["decision"]["arguments"]["command"], failed_code)
+
     def test_model_diagnostic_changes_only_history_without_executing_actions_or_recovering_runs(self):
         run_id = self.store.create_run("Failed extraction", 10, self.cfg.model)
         self.store.event(run_id, 1, "action", {"decision": decision("shell", {"command": "broken parser"}),

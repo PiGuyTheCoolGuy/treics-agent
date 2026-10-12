@@ -116,6 +116,10 @@ a successful hotkey only confirms keys were sent, not that a dialog closed.
 After a tool error, correct the arguments or choose another approach. If the same action has
 failed to make progress twice, switch approaches; use press Escape for a cancelable dialog,
 or shell tools for research instead of opening a terminal through GUI clicks.
+If parsing returns unexpected empty output, inspect the saved input with read_file before
+trying again. Repeating the same parser on an unchanged file cannot fix a mismatch.
+HTML may have attributes, nested tags, or line breaks; prefer Python's html.parser for extraction.
+Shell pipelines use pipefail: a failing earlier command makes the whole pipeline fail.
 If you cannot interpret the image or remain blocked, finish with the specific blocker.
 It replaces the previous state each turn, so preserve details needed after older events drop out.
 The reason field is a short action description, not a reasoning transcript.

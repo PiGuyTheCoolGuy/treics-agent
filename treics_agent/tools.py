@@ -147,7 +147,7 @@ class Tools:
             raise ToolError(f"Working directory does not exist: {cwd}")
         if stop.is_set():
             raise Cancelled()
-        process = subprocess.Popen(["/bin/bash", "-lc", command], cwd=cwd, env=self.config.desktop_env(),
+        process = subprocess.Popen(["/bin/bash", "-o", "pipefail", "-lc", command], cwd=cwd, env=self.config.desktop_env(),
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         with self.process_lock:
             self.process = process

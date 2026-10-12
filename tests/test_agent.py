@@ -57,11 +57,13 @@ class FakeModel:
         self.calls = 0
         self.budgets = []
         self.events = []
+        self.states = []
 
     def decide(self, task, state, memory, events, screen, stop, budget=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)
+        self.states.append(state)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
@@ -308,6 +310,30 @@ class AgentTests(unittest.TestCase):
         result = self.tools.execute("shell", {"command": "python3 -c 'print(\"x\"*100000)'"}, stopped)
         self.assertEqual(len(result["output"]), 48000)
         self.assertTrue(result["truncated"])
+
+    def test_shell_pipeline_does_not_hide_missing_heading(self):
+        # The run log's grep/sed pipeline falsely reported success on no match.
+        self.tools.execute("write_file", {"path": "page.html", "content": '<h1 class="title">Example</h1>'},
+                           threading.Event())
+        result = self.tools.execute("shell", {"command": "grep -o '<h1>[^<]*</h1>' page.html | sed 's/<[^>]*>//g'"},
+                                    threading.Event())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["output"], "")
+        result = self.tools.execute("shell", {"command": "printf 'Example\\n' | sed 's/Example/Verified/'"},
+                                    threading.Event())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "Verified\n")
+
+    def test_failed_pipeline_does_not_save_claimed_success(self):
+        model = self.build([decision("shell", {"command": "false | cat"}, "Claimed extraction succeeded"),
+                    decision("finish", {"summary": "Reported missing output"}, "Extraction was blocked")])
+        run = self.complete(max_steps=3)
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["state"], "Extraction was blocked")
+        self.assertEqual(model.states[1], "")
+        result = next(e["data"]["result"] for e in self.store.events(run["id"]) if e["kind"] == "action")
+        self.assertFalse(result["ok"])
 
     def test_cancel_running_shell_process_group(self):
         stopped = threading.Event()

@@ -25,6 +25,8 @@ flowchart TD
 
 For shell/file/note actions the next prompt omits images, and previous coordinates are invalidated. The model requests a screenshot before returning to coordinate actions. Screenshot coordinates are mapped to the actual desktop when the image is downscaled.
 
+Shell commands run with Bash `pipefail`, so a failed extraction or download inside a pipeline is not hidden by a successful final command. A shell action's proposed state is saved only when the command succeeds; its exit status and output remain in the activity log either way.
+
 Only a short action description is requested, alongside a compact working summary. The model does not need to generate a long reasoning transcript. JSON is constrained by Ollama's schema format and independently validated locally. The controller does not require native tool-call parsing from Qwen.
 
 The response schema has a separate branch for each action, including its required arguments, types, ranges, and nonempty keyboard lists. Coordinate maxima match the attached screenshot. Argument errors identify the failed action, and the controller does not save a failed action's proposed working state as achieved progress. Typing validates the paste-key combination before changing the clipboard.

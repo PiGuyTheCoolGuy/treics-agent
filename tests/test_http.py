@@ -168,9 +168,18 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(len(payload["messages"]), 2)
         self.assertEqual(len(payload["messages"][1]["images"]), 1)
         self.assertEqual(json.loads(payload["messages"][1]["content"])["step_budget"], budget)
-        self.assertEqual(payload["format"]["properties"]["action"]["enum"][-1], "finish")
+        cases = {c["properties"]["action"]["enum"][0]: c for c in payload["format"]["anyOf"]}
+        self.assertIn("finish", cases)
+        self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 767)
         client.decide("Test task", "state", "notes", [], None, threading.Event())
         self.assertNotIn("images", self.upstream.payloads[-1]["messages"][1])
+
+    def test_real_model_client_rejects_invalid_paste_keys_before_action_execution(self):
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        self.upstream.decision = decision("type", {"text": "https://example.com", "paste_keys": []})
+        with self.assertRaisesRegex(ModelError, "type.arguments.paste_keys"):
+            ModelClient(cfg).decide("Type", "", "", [], self.desktop.capture(), threading.Event())
 
     def test_dashboard_exposes_automatic_pause_reason_and_resume_control(self):
         self.agent.model = FakeModel([decision("screenshot", {})] * 3 +

@@ -8,13 +8,14 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from PIL import Image
 
 from treics_agent.agent import Agent
 from treics_agent.config import Config, initialize_config, load_config
-from treics_agent.model import ModelError, parse_decision
+from treics_agent.model import ARGUMENT_SCHEMAS, ModelError, decision_schema, parse_decision
 from treics_agent.progress import ProgressGuard
 from treics_agent.storage import Store
 from treics_agent.tools import Desktop, ToolError, Tools
@@ -229,6 +230,36 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(model.calls, 3)
         self.assertFalse((self.config.work_path / "forbidden").exists())
 
+    def test_interleaved_typing_errors_pause_without_recording_failed_state(self):
+        # Reproduce the uploaded log: focus, failed paste, focus, failed paste...
+        focus = decision("hotkey", {"keys": ["ctrl", "l"]}, "Address bar focused")
+        paste = decision("type", {"text": "https://example.com", "paste_keys": []}, "URL was typed")
+        model = self.build([focus, paste] * 3 + [decision("finish", {"summary": "Blocked"})])
+        # Skip tool/error delays; the condition-based pause gate remains real.
+        with mock.patch.object(self.agent.stop_event, "wait", side_effect=lambda timeout: self.agent.stop_event.is_set()):
+            run_id = self.agent.start("Reproduce typing loop", 15)
+            self.wait_for_status(run_id, "paused")
+            self.assertEqual(model.calls, 6)
+            self.assertEqual(self.store.run(run_id)["state"], "Address bar focused")
+            self.assertIn("3 repeated type errors", self.agent.snapshot()["pause_reason"])
+            errors = [e for e in self.store.events(run_id) if e["kind"] == "error"]
+            self.assertEqual(len(errors), 3)
+            self.assertEqual(errors[-1]["data"]["decision"]["action"], "type")
+            self.assertIn("type failed:", errors[-1]["data"]["message"])
+            self.agent.resume()
+            self.agent.thread.join(3)
+            self.assertEqual(self.store.run(run_id)["status"], "completed")
+
+    def test_typing_uses_default_keys_and_rejects_empty_keys_before_clipboard(self):
+        with mock.patch("treics_agent.tools.subprocess.run") as run:
+            with self.assertRaises(ToolError):
+                self.tools.execute("type", {"text": "https://example.com", "paste_keys": []}, threading.Event())
+            run.assert_not_called()
+            result = self.tools.execute("type", {"text": "https://example.com"}, threading.Event())
+            self.assertTrue(result["ok"])
+            self.assertEqual(run.call_args.kwargs["input"], b"https://example.com")
+            self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], self.desktop.commands)
+
     def test_step_limit_still_ends_run_when_last_action_would_trigger_pause(self):
         model = self.build([decision("screenshot", {})] * 3)
         run = self.complete(max_steps=3)
@@ -333,6 +364,28 @@ class AgentTests(unittest.TestCase):
                         json.dumps({**valid, "state": "x" * 3001}), json.dumps({**valid, "extra": True})):
             with self.assertRaises(ModelError):
                 parse_decision(invalid)
+
+    def test_action_schema_rejects_the_logged_empty_keys_and_malformed_coordinates(self):
+        invalid = [decision("type", {"text": "https://example.com", "paste_keys": []}),
+                   decision("hotkey", {"keys": "ctrl+l"}),
+                   decision("click", {"x": [624, 668]}),
+                   decision("click", {"x": 10, "y": True}),
+                   decision("screenshot", {"text": "invented"})]
+        for obj in invalid:
+            with self.assertRaises(ModelError):
+                parse_decision(json.dumps(obj))
+        for obj in (decision("type", {"text": "hello"}),
+                    decision("type", {"text": "hello", "paste_keys": ["ctrl", "shift", "v"]}),
+                    decision("shell", {"command": "curl -fsSL https://example.com", "timeout": 60})):
+            self.assertEqual(parse_decision(json.dumps(obj)), obj)
+        schema = decision_schema({"width": 1024, "height": 768})
+        cases = {c["properties"]["action"]["enum"][0]: c for c in schema["anyOf"]}
+        self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 767)
+        self.assertEqual(cases["type"]["properties"]["arguments"]["properties"]["paste_keys"]["minItems"], 1)
+        # Keep generation/validation fields aligned with the actual tool interface.
+        for action, (required, optional) in Tools.ARGS.items():
+            self.assertEqual(set(ARGUMENT_SCHEMAS[action]["required"]), required)
+            self.assertEqual(set(ARGUMENT_SCHEMAS[action]["properties"]), required | optional)
 
 
 if __name__ == "__main__":

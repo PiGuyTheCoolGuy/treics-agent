@@ -15,8 +15,13 @@ class ProgressGuard:
     def __init__(self):
         self.attempts: deque[str] = deque(maxlen=12)
         self.last_text_result: str | None = None
+        self.recent_errors: deque[str | None] = deque(maxlen=12)
 
     def reset(self) -> None:
+        self.recent_errors.clear()
+        self._reset_attempts()
+
+    def _reset_attempts(self) -> None:
         self.attempts.clear()
         self.last_text_result = None
 
@@ -41,12 +46,13 @@ class ProgressGuard:
 
     def observe(self, decision: dict, result: dict,
                 before: dict | None, after: dict | None) -> str | None:
+        self.recent_errors.append(None)
         action = decision["action"]
         signature = json.dumps([action, decision["arguments"]], sort_keys=True, ensure_ascii=False)
         if action in Tools.GUI_ACTIONS:
             self.last_text_result = None
             if not self.same_screen(before, after):
-                self.reset()
+                self._reset_attempts()
                 return None
             evidence = "the desktop screenshot stayed essentially unchanged"
         elif action in {"shell", "read_file", "list_files"}:
@@ -55,7 +61,7 @@ class ProgressGuard:
             observation = signature + json.dumps(result, sort_keys=True, ensure_ascii=False)
             fingerprint = hashlib.sha256(observation.encode()).hexdigest()
             if fingerprint != self.last_text_result:
-                self.reset()
+                self._reset_attempts()
             self.last_text_result = fingerprint
             evidence = "the tool returned the same result"
         else:
@@ -67,4 +73,14 @@ class ProgressGuard:
             return (f"Automatically paused after {count} matching {action} actions: {evidence}. "
                     "Review the desktop and activity log. Resume requests a new decision; "
                     "Stop ends this task.")
+        return None
+
+    def error(self, decision: dict | None, message: str) -> str | None:
+        action = decision["action"] if decision else "model"
+        signature = action + ": " + message
+        self.recent_errors.append(signature)
+        count = self.recent_errors.count(signature)
+        if count >= 3:
+            return (f"Automatically paused after {count} repeated {action} errors within twelve attempts: "
+                    f"{message[:500]}. Resume requests a new decision; Stop ends this task.")
         return None

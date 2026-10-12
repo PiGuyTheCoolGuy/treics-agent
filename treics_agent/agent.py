@@ -160,6 +160,7 @@ class Agent:
                 self.store.update(run_id, step=step)
                 self.set_phase("model")
                 started = time.monotonic()
+                decision = None
                 try:
                     decision, metrics = self.model.decide(
                         run["task"], self.store.run(run_id)["state"], self.store.memory(),
@@ -170,10 +171,11 @@ class Agent:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
                     self._gate(deadline)
-                    self.store.update(run_id, state=decision["state"])
                     self.set_phase("action")
                     self.store.event(run_id, step, "action_started", {"decision": decision})
                     result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
+                    if result.get("ok", False):
+                        self.store.update(run_id, state=decision["state"])
                     self.store.event(run_id, step, "action", {"decision": decision, "result": result,
                                                              "model_seconds": self.last_model_seconds,
                                                              "metrics": metrics})
@@ -202,10 +204,24 @@ class Agent:
                     if self.stop_event.is_set():
                         raise Cancelled() from exc
                     errors += 1
-                    self.store.event(run_id, step, "error", {"message": str(exc)[:2000]})
+                    message = str(exc)[:2000]
+                    error_data = {"message": message}
+                    if decision:
+                        error_data["decision"] = decision
+                        error_data["message"] = decision["action"] + " failed: " + message
+                    self.store.event(run_id, step, "error", error_data)
                     if isinstance(exc, (ToolError, OSError)):
                         screen = None
                         self.tools.desktop.frame = None
+                    reason = progress.error(decision, message)
+                    if reason and step < run["max_steps"]:
+                        self._pause_stalled(run_id, step, reason, deadline)
+                        progress.reset()
+                        errors = 0
+                        self._gate(deadline)
+                        self.set_phase("observing")
+                        screen = self.tools.desktop.capture()
+                        continue
                     if self.stop_event.wait(min(errors * 2, 10)):
                         raise Cancelled()
                 if errors >= 5:

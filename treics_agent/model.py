@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
+import re
 import socket
 import threading
 from urllib.parse import urlsplit
@@ -28,20 +30,69 @@ TOOLS = {
     "finish": '{"summary":str}: state the actual result and any unresolved issue; this ends the run.',
 }
 
-DECISION_SCHEMA = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "reason": {"type": "string", "maxLength": 600},
-        "action": {"type": "string", "enum": list(TOOLS)},
-        "arguments": {"type": "object"},
-        "state": {"type": "string", "maxLength": 3000},
-    },
-    "required": ["reason", "action", "arguments", "state"],
+def arguments_schema(required: dict, optional: dict | None = None) -> dict:
+    return {"type": "object", "properties": {**required, **(optional or {})},
+            "required": list(required), "additionalProperties": False}
+
+
+KEY = {"type": "string", "pattern": "^[A-Za-z0-9_]+$", "maxLength": 64}
+KEYS = {"type": "array", "items": KEY, "minItems": 1, "maxItems": 6}
+COORDINATE = {"type": "integer", "minimum": 0}
+POINT = {"x": COORDINATE, "y": COORDINATE}
+PATH = {"type": "string", "maxLength": 4096}
+ARGUMENT_SCHEMAS = {
+    "screenshot": arguments_schema({}),
+    "click": arguments_schema(POINT, {"button": {"enum": ["left", "right", "middle"]},
+                                      "clicks": {"type": "integer", "minimum": 1, "maximum": 2}}),
+    "move": arguments_schema(POINT),
+    "drag": arguments_schema({**POINT, "end_x": COORDINATE, "end_y": COORDINATE},
+                             {"duration": {"type": "number", "minimum": 0.1, "maximum": 5}}),
+    "scroll": arguments_schema({"amount": {"type": "integer", "minimum": -30, "maximum": 30}}, POINT),
+    "type": arguments_schema({"text": {"type": "string", "maxLength": 32000}}, {"paste_keys": KEYS}),
+    "press": arguments_schema({"key": KEY}),
+    "hotkey": arguments_schema({"keys": KEYS}),
+    "shell": arguments_schema({"command": {"type": "string", "maxLength": 32000}},
+                              {"cwd": PATH, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}),
+    "read_file": arguments_schema({"path": PATH},
+                                  {"offset": {"type": "integer", "minimum": 0, "maximum": 10000000},
+                                   "limit": {"type": "integer", "minimum": 1, "maximum": 48000}}),
+    "write_file": arguments_schema({"path": PATH, "content": {"type": "string", "maxLength": 100000}}),
+    "list_files": arguments_schema({}, {"path": PATH}),
+    "open_browser": arguments_schema({"url": {"type": "string", "pattern": "^https?://.+$",
+                                               "maxLength": 4096}}),
+    "wait": arguments_schema({"seconds": {"type": "number", "minimum": 0.1, "maximum": 30}}),
+    "remember": arguments_schema({"text": {"type": "string", "maxLength": 6000}}),
+    "finish": arguments_schema({"summary": {"type": "string", "maxLength": 12000}}),
 }
+
+
+def decision_schema(screen: dict | None = None) -> dict:
+    cases = []
+    for action, arguments in ARGUMENT_SCHEMAS.items():
+        properties = {key: dict(schema) for key, schema in arguments["properties"].items()}
+        if screen:
+            for key in ("x", "end_x", "y", "end_y"):
+                if key in properties:
+                    properties[key]["maximum"] = screen["width" if key.endswith("x") else "height"] - 1
+        cases.append({"type": "object", "additionalProperties": False,
+                      "properties": {"action": {"enum": [action]},
+                                     "arguments": {**arguments, "properties": properties},
+                                     "reason": {"type": "string", "maxLength": 600},
+                                     "state": {"type": "string", "maxLength": 3000}},
+                      "required": ["reason", "action", "arguments", "state"]})
+    return {"type": "object", "required": ["reason", "action", "arguments", "state"], "anyOf": cases}
+
+
+DECISION_SCHEMA = decision_schema()
 
 SYSTEM_PROMPT = """You are Treic's Agent, a practical computer-use assistant inside a disposable Linux VM.
 Complete the user's task using the available tools. You can operate the entire VM, including sudo
 when configured, but cannot control the host. Prefer terminal and file tools for efficient work.
+Follow the task's requested order and tools. The current browser page is incidental context,
+not a reason to browse. Fetching a page with shell means calling shell with curl or Python;
+there is no need to open a terminal or navigate the browser first.
+For browser navigation prefer open_browser. For type, omit paste_keys to use Ctrl+V;
+never send an empty paste_keys array. Tool errors identify the action that actually failed.
 For GUI work, inspect screenshots and use screenshot pixel coordinates (origin at top left).
 The controller maps screenshot coordinates to the actual desktop. Do not rescale them yourself.
 Coordinates are separate integer x and y fields, never an array. Use literal image pixels,
@@ -81,6 +132,39 @@ class ModelError(Exception):
     pass
 
 
+def validate_arguments(value, schema: dict, path: str) -> None:
+    """Validate the subset of JSON Schema used by our action definitions."""
+    kind = schema.get("type")
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "integer": type(value) is int,
+             "number": type(value) in (int, float)}
+    if kind and not valid[kind]:
+        raise ModelError(f"{path} must be {kind}.")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ModelError(f"{path} must be one of {schema['enum']}.")
+    if kind == "object":
+        missing = set(schema["required"]) - value.keys()
+        extra = value.keys() - schema["properties"].keys()
+        if missing or extra:
+            raise ModelError(f"{path}: missing fields {sorted(missing)}; unexpected fields {sorted(extra)}.")
+        for key, child in value.items():
+            validate_arguments(child, schema["properties"][key], path + "." + key)
+    elif kind == "array":
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+            raise ModelError(f"{path} must contain {schema.get('minItems', 0)}–{schema['maxItems']} key names; "
+                             "omit optional paste_keys to use Ctrl+V.")
+        for child in value:
+            validate_arguments(child, schema["items"], path + "[]")
+    elif kind == "string":
+        if "\0" in value or len(value) > schema.get("maxLength", len(value)):
+            raise ModelError(f"{path} is too long or contains NUL bytes.")
+        if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
+            raise ModelError(f"{path} has an invalid format.")
+    elif kind in ("number", "integer"):
+        if (type(value) is float and not math.isfinite(value)) or not schema.get("minimum", value) <= value <= schema.get("maximum", value):
+            raise ModelError(f"{path} is outside the allowed range.")
+
+
 def parse_decision(content: str) -> dict:
     content = content.strip()
     if content.startswith("```") and content.endswith("```"):
@@ -98,6 +182,7 @@ def parse_decision(content: str) -> dict:
     for key, maximum in (("reason", 600), ("state", 3000)):
         if not isinstance(obj[key], str) or len(obj[key]) > maximum:
             raise ModelError(f"{key} must be a string of at most {maximum} characters.")
+    validate_arguments(obj["arguments"], ARGUMENT_SCHEMAS[obj["action"]], obj["action"] + ".arguments")
     return obj
 
 
@@ -184,8 +269,9 @@ class ModelClient:
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\nTools:\n" + tools +
-                 "\nResponse schema:\n" + json.dumps(DECISION_SCHEMA)}, user],
-            "format": DECISION_SCHEMA, "stream": False,
+                 '\nResponse shape: {"action":"tool name", "arguments":{tool-specific fields}, '
+                 '"reason":"short description", "state":"observed progress and next step"}'}, user],
+            "format": decision_schema(screen), "stream": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
                         "num_thread": self.config.num_thread, "num_predict": self.config.num_predict},

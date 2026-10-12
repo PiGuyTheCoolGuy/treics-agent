@@ -86,7 +86,8 @@ class Desktop:
         return (min(frame["desktop_width"] - 1, round(x * frame["desktop_width"] / frame["width"])),
                 min(frame["desktop_height"] - 1, round(y * frame["desktop_height"] / frame["height"])))
 
-    def key(self, keys: list[str]) -> None:
+    @staticmethod
+    def key_combination(keys: list[str]) -> str:
         if not isinstance(keys, list) or not 1 <= len(keys) <= 6:
             raise ToolError("keys must be a list of 1–6 X11 key names.")
         if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_]+", k) for k in keys):
@@ -94,7 +95,10 @@ class Desktop:
         aliases = {"enter": "Return", "esc": "Escape", "escape": "Escape", "backspace": "BackSpace",
                    "space": "space", "tab": "Tab", "delete": "Delete", "control": "ctrl",
                    "super": "super", "shift": "shift", "alt": "alt"}
-        self.command(["xdotool", "key", "--clearmodifiers", "+".join(aliases.get(k.lower(), k) for k in keys)])
+        return "+".join(aliases.get(k.lower(), k) for k in keys)
+
+    def key(self, keys: list[str]) -> None:
+        self.command(["xdotool", "key", "--clearmodifiers", self.key_combination(keys)])
 
 
 class Tools:
@@ -265,6 +269,8 @@ class Tools:
             elif action == "type":
                 content = text(a["text"], "text", 32000)
                 keys = a.get("paste_keys", ["ctrl", "v"])
+                # Reject invalid paste keys before altering the clipboard.
+                d.key_combination(keys)
                 # xclip forks to keep serving the selection; do not capture its inherited pipes.
                 subprocess.run(["xclip", "-selection", "clipboard"], input=content.encode(),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             print(store.memory())
             store.close()
             return 0
-        agent = Agent(cfg, store)
+        agent = Agent(cfg, store, config_file=config_path())
         if args.command == "run":
             run_id = agent.start(args.task, args.max_steps)
             print(f"Run {run_id}. Logs: {cfg.data_path / 'agent.db'}", flush=True)

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import re
 import secrets
+import stat
+import tempfile
 import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+def validate_model_name(model: str) -> None:
+    if (not isinstance(model, str) or not 1 <= len(model) <= 256
+            or any(char.isspace() or ord(char) < 32 for char in model)):
+        raise ValueError("model must be a model name of 1–256 characters without whitespace")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,8 +71,7 @@ class Config:
             raise ValueError("ollama_url must be an http(s) URL without embedded credentials")
         if url.path not in ("", "/") or url.query or url.fragment:
             raise ValueError("ollama_url must be the server origin, without an API path")
-        if not self.model.strip():
-            raise ValueError("model cannot be empty")
+        validate_model_name(self.model)
         if self.dashboard_token and len(self.dashboard_token) < 24:
             raise ValueError("dashboard_token must contain at least 24 characters")
 
@@ -100,8 +108,6 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def initialize_config(path: Path | None = None) -> Path:
-    import json
-
     path = path or config_path()
     if path.exists():
         return path
@@ -111,6 +117,39 @@ def initialize_config(path: Path | None = None) -> Path:
     with path.open("x") as handle:
         os.chmod(path, 0o600)
         handle.write("# Local configuration; contains credentials.\n" + "\n".join(lines) + "\n")
+    return path
+
+
+def set_model(model: str, path: Path | None = None) -> Path:
+    validate_model_name(model)
+    if "TREICS_AGENT_MODEL" in os.environ and os.environ["TREICS_AGENT_MODEL"] != model:
+        raise ValueError("TREICS_AGENT_MODEL fixes the model. Remove that environment override and restart before switching.")
+    path = (path or config_path()).expanduser()
+    if not path.exists():
+        raise ValueError("Configuration is missing; run treics-agent init first.")
+    source = path.read_text()
+    load_config(path)
+    setting = "model = " + json.dumps(model)
+    pattern = r"""^[ \t]*(?:model|"model"|'model')[ \t]*=.*$"""
+    if re.search(pattern, source, re.MULTILINE):
+        proposed = re.sub(pattern, lambda _: setting, source, flags=re.MULTILINE)
+    else:
+        proposed = setting + "\n" + source
+    values = tomllib.loads(proposed)
+    if values.get("model") != model:
+        raise ValueError("Could not update the model setting; configuration was not changed.")
+    Config(**values).validate()
+    # Replace atomically: a failed write cannot truncate credentials or other settings.
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(proposed)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return path
 
 

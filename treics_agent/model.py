@@ -8,7 +8,7 @@ import socket
 import threading
 from urllib.parse import urlsplit
 
-from .config import Config
+from .config import Config, validate_model_name
 from .checklist import CHECKLIST_PROMPT, ITEM_SCHEMA, UPDATES_SCHEMA
 
 
@@ -312,10 +312,10 @@ class ModelClient:
                 conn.close()
 
     def request(self, method: str, path: str, payload: dict | None = None,
-                stop: threading.Event | None = None) -> dict:
+                stop: threading.Event | None = None, timeout: float | None = None) -> dict:
         url = urlsplit(self.config.ollama_url)
         cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
-        conn = cls(url.hostname, url.port, timeout=10)
+        conn = cls(url.hostname, url.port, timeout=min(10, timeout) if timeout is not None else 10)
         headers = {"Content-Type": "application/json"}
         if self.config.ollama_token:
             headers["Authorization"] = "Bearer " + self.config.ollama_token
@@ -326,7 +326,7 @@ class ModelClient:
                 raise Cancelled()
             conn.connect()
             if conn.sock:
-                conn.sock.settimeout(self.config.request_timeout)
+                conn.sock.settimeout(timeout if timeout is not None else self.config.request_timeout)
                 with self.lock:
                     self.active_socket = conn.sock
             if stop and stop.is_set():
@@ -356,6 +356,33 @@ class ModelClient:
                 if self.connection is conn:
                     self.connection = None
                     self.active_socket = None
+
+    def available_models(self) -> list[str]:
+        result = self.request("GET", "/api/tags", timeout=3)
+        entries = result.get("models")
+        if not isinstance(entries, list):
+            raise ModelError("Ollama returned an invalid model list.")
+        names = set()
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            try:
+                validate_model_name(name)
+            except ValueError as exc:
+                raise ModelError("Ollama returned an invalid model name.") from exc
+            names.add(name)
+        return sorted(names)
+
+    def check_model(self, name: str) -> None:
+        validate_model_name(name)
+        if name not in self.available_models():
+            raise ValueError("Model is not installed or allowed by the gateway. Refresh the model list.")
+        details = self.request("POST", "/api/show", {"model": name}, timeout=3)
+        capabilities = details.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, list) or not all(isinstance(value, str) for value in capabilities):
+                raise ModelError("Ollama returned invalid model capabilities.")
+            if "vision" not in capabilities:
+                raise ValueError("This model cannot read screenshots. Choose a model with vision support.")
 
     def decide(self, task: str, state: str, memory: str, events: list[dict],
                screen: dict | None, stop: threading.Event,

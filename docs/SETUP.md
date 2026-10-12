@@ -74,7 +74,11 @@ The default is a 5 FPS target at JPEG quality 70. To adjust it, add `stream_fps 
 
 ## 4. Configure or switch models
 
-Inside the VM, edit:
+In the dashboard's **Model** panel, select an installed model and click **Use model**. The new selection applies immediately to future tasks and is saved in the guest configuration for restarts. Finish or stop the current task first; paused tasks keep their original model. The history shows each run's model so you can compare results. A failed check or save leaves the previous selection active.
+
+The list loads when you connect. **Refresh models** updates it after a host model install or gateway allowlist change. Models must be installed and allowed by the gateway to appear. The controller rejects models that report no vision support because tasks begin with a screenshot. Older Ollama versions that omit capability metadata remain supported; use `doctor --test-model` to check their image handling.
+
+To adjust other settings or edit the model manually, inside the VM:
 
 ```bash
 nano ~/.config/treics-agent/config.toml
@@ -89,7 +93,9 @@ To compare the smaller model, pull it **on the host**:
 ollama pull qwen3-vl:8b
 ```
 
-Change the guest configuration to `model = "qwen3-vl:8b"`, restart the guest controller, and run `doctor --test-model` again. Both tags are in the gateway allowlist. To use another local vision model, add its exact tag to `MODEL_PROXY_MODELS` in `/etc/treics-agent/model-proxy.env` on the host, restart `treic-model-proxy`, and set the same tag in the guest config. A text-only Qwen model cannot inspect screenshots.
+Then click **Refresh models**, choose `qwen3-vl:8b`, and click **Use model**. Both Qwen3-VL tags are already in the default gateway allowlist. To use another local vision model, pull its exact tag on the host, add that tag to `MODEL_PROXY_MODELS` in `/etc/treics-agent/model-proxy.env` on the host, and run `sudo systemctl restart treic-model-proxy`. Refresh the dashboard's model list and choose it. A text-only Qwen model cannot inspect screenshots.
+
+The `TREICS_AGENT_MODEL` environment variable overrides the configuration. Remove that override and restart the controller before selecting a different model in the dashboard. The selector uses short metadata requests through the existing authenticated gateway; discovery remains available during inference without interfering with Stop or the live desktop feed. The first task with a newly selected model may include its normal load time.
 
 The gateway limits context to 16,384 tokens, output to 4,096 tokens, threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
 

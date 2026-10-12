@@ -8,6 +8,7 @@ from importlib.resources import files
 from urllib.parse import urlsplit
 
 from .agent import Agent
+from .model import ModelError
 from .stream import BOUNDARY, DesktopStream
 
 
@@ -117,8 +118,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send(200, files("treics_agent").joinpath("static/index.html").read_bytes(), "text/html; charset=utf-8")
             return
-        if path == "/assets/desktop-stream.js":
-            self.send(200, files("treics_agent").joinpath("static/desktop-stream.js").read_bytes(),
+        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js"):
+            self.send(200, files("treics_agent").joinpath("static", path.rsplit("/", 1)[1]).read_bytes(),
                       "application/javascript; charset=utf-8")
             return
         if not self.authorized():
@@ -126,6 +127,11 @@ class Handler(BaseHTTPRequestHandler):
         agent = self.server.agent
         if path == "/api/state":
             self.send(200, {**agent.snapshot(), "desktop_stream": self.server.desktop_stream.snapshot()})
+        elif path == "/api/models":
+            try:
+                self.send(200, agent.available_models())
+            except ModelError as exc:
+                self.send(502, {"error": str(exc)[:1500]})
         elif path == "/api/desktop/stream":
             self.stream_desktop()
         elif match := re.fullmatch(r"/api/runs/([a-f0-9]{32})", path):
@@ -164,6 +170,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/start":
                 run_id = agent.start(payload.get("task"), payload.get("max_steps"))
                 self.send(201, {"run_id": run_id})
+            elif path == "/api/model":
+                self.send(200, agent.switch_model(payload.get("model")))
             elif path in ("/api/pause", "/api/resume", "/api/stop"):
                 getattr(agent, path.rsplit("/", 1)[1])()
                 self.send(200, {"ok": True})
@@ -175,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, {"ok": True})
             else:
                 self.send(404, {"error": "Unknown endpoint."})
+        except ModelError as exc:
+            self.send(502, {"error": str(exc)[:1500]})
         except (ValueError, OSError, TimeoutError) as exc:
             self.send(400, {"error": str(exc)[:1500]})
         except Exception as exc:

@@ -8,6 +8,108 @@ from pathlib import Path
 
 @unittest.skipUnless(shutil.which("node"), "Node is unavailable for dashboard request tests")
 class DashboardTests(unittest.TestCase):
+    def test_model_selection_preserves_drafts_locks_active_tasks_and_saves_changes(self):
+        script = r'''
+const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
+const elements=new Map();
+function element(id) {
+  if(!elements.has(id)) elements.set(id,{value:'',children:[],disabled:false,textContent:'',
+    replaceChildren(){this.children=[]},append(item){this.children.push(item)}});
+  return elements.get(id);
+}
+const context=vm.createContext({document:{getElementById:element,createElement:()=>({})}});
+vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+const calls=[], current='qwen3-vl:30b-a3b-instruct', smaller='qwen3-vl:8b';
+let finishSwitch, changes=0;
+const selector=new context.ModelSelector(async(path,body)=>{
+  calls.push({path,body});
+  if(path==='/api/models') return {model:current,models:[current,smaller]};
+  return new Promise(resolve=>{finishSwitch=()=>resolve({model:body.model})});
+},async()=>{changes++});
+const idle={model:current,task_active:false,model_switching:false,current:null};
+(async()=>{
+  selector.update(idle);
+  await selector.refresh();
+  assert.deepEqual(element('modelSelect').children.map(option=>option.textContent),[current,smaller]);
+  assert.equal(element('useModel').disabled,true);
+  element('modelSelect').value=smaller;
+  element('modelSelect').onchange();
+  selector.update(idle);
+  assert.equal(element('modelSelect').value,smaller,'Polling overwrote the staged selection');
+  assert.equal(element('useModel').disabled,false);
+  for(const status of ['running','pausing','paused','stopping']) {
+    selector.update({model:current,current:{status}});
+    assert.equal(element('useModel').disabled,true);
+    await selector.apply();
+  }
+  // A completed database row can still have a controller thread finishing cleanup.
+  selector.update({...idle,task_active:true,current:{status:'completed'}});
+  assert.equal(element('useModel').disabled,true);
+  selector.update({...idle,model_switching:true});
+  assert.equal(element('start').disabled,true);
+  selector.update(idle);
+  assert.equal(calls.length,1,'State polling retriggered model discovery or switching');
+  const switching=selector.apply();
+  assert.equal(element('start').disabled,true,'Start remained enabled while switching');
+  assert.equal(element('refreshModels').disabled,true);
+  selector.update(idle);
+  assert.equal(element('start').disabled,true,'A status poll unlocked an in-flight switch');
+  finishSwitch(); await switching;
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1])),{path:'/api/model',body:{model:smaller}});
+  assert.equal(selector.current,smaller);
+  assert.equal(element('modelSelect').value,smaller);
+  assert.equal(element('start').disabled,false);
+  assert.equal(element('useModel').disabled,true);
+  assert.match(element('modelStatus').textContent,/Saved/);
+  assert.equal(changes,1);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+        path = Path(__file__).resolve().parents[1] / "treics_agent/static/model-selector.js"
+        result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_model_list_and_switch_errors_recover_without_clearing_current_model(self):
+        script = r'''
+const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
+const elements=new Map();
+const element=id=>{if(!elements.has(id))elements.set(id,{value:'',children:[],textContent:'',
+  replaceChildren(){this.children=[]},append(option){this.children.push(option)}});return elements.get(id)};
+const context=vm.createContext({document:{getElementById:element,createElement:()=>({})}});
+vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+const current='qwen3-vl:30b-a3b-instruct', other='qwen3-vl:8b';
+let failList=true;
+const selector=new context.ModelSelector(async(path)=>{
+  if(path==='/api/models') {
+    if(failList)throw new Error('gateway offline');
+    return {model:current,models:[other]};
+  }
+  throw new Error('model cannot read screenshots');
+},async()=>{throw new Error('Unexpected model change')});
+(async()=>{
+  selector.update({model:current,task_active:false});
+  await selector.refresh();
+  assert.match(element('modelStatus').textContent,/gateway offline/);
+  assert.equal(element('refreshModels').disabled,false);
+  assert.equal(element('start').disabled,false);
+  assert.equal(selector.current,current);
+  failList=false;await selector.refresh();
+  assert.equal(element('modelSelect').children.at(-1).disabled,true,'Unavailable model was offered as a choice');
+  element('modelSelect').value=other;element('modelSelect').onchange();
+  await selector.apply();
+  assert.equal(selector.current,current);
+  assert.match(element('modelStatus').textContent,/cannot read screenshots/);
+  assert.equal(element('start').disabled,false);
+  assert.equal(element('useModel').disabled,false,'Failed switch could not be retried');
+  selector.api=async()=>({models:[],model:current});
+  await selector.refresh();
+  assert.equal(element('modelSelect').disabled,true);
+  assert.match(element('modelStatus').textContent,/No models available/);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+        path = Path(__file__).resolve().parents[1] / "treics_agent/static/model-selector.js"
+        result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_live_stream_reconnects_after_disconnect_and_cancels_cleanly(self):
         script = r'''
 const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
@@ -64,6 +166,7 @@ const context = vm.createContext({
   AbortController, Date, URL, TextDecoder, Blob,
 });
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
 vm.runInContext(source, context);
 function stall(signal) {
   return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
@@ -95,7 +198,8 @@ function stall(signal) {
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
         path = Path(__file__).resolve().parents[1] / "treics_agent/static/index.html"
-        result = subprocess.run(["node", "-e", script, str(path), str(path.with_name("desktop-stream.js"))],
+        result = subprocess.run(["node", "-e", script, str(path), str(path.with_name("desktop-stream.js")),
+                                 str(path.with_name("model-selector.js"))],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

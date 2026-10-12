@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from treics_agent.agent import Agent
-from treics_agent.config import Config
+from treics_agent.config import Config, load_config
 from treics_agent.model import Cancelled, ModelClient, ModelError
 from treics_agent.server import AgentHTTPServer
 from treics_agent.storage import Store
@@ -59,7 +59,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        if self.server.block:
+        if self.server.block and (self.server.block_paths is None or self.path in self.server.block_paths):
             self.server.entered.set()
             self.server.release.wait(5)
         try:
@@ -69,7 +69,8 @@ class FakeOllama(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/tags":
-            self.reply({"models": [{"name": "qwen3-vl:30b-a3b-instruct"}, {"name": "private-model"}]})
+            self.reply({"models": [{"name": "qwen3-vl:30b-a3b-instruct"},
+                                   {"name": "qwen3-vl:8b"}, {"name": "private-model"}]})
         else:
             self.reply({"version": "test"})
 
@@ -77,7 +78,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.payloads.append(payload)
         if self.path == "/api/show":
-            return self.reply({"capabilities": ["completion", "vision"]})
+            return self.reply({"capabilities": self.server.capabilities.get(payload["model"], ["completion", "vision"])})
         self.reply({"message": {"role": "assistant", "content": json.dumps(self.server.decision)},
                     "done": True, "total_duration": 1000000000, "eval_count": 20})
 
@@ -96,6 +97,8 @@ class HTTPTests(unittest.TestCase):
         self.upstream.daemon_threads = True
         self.upstream.payloads = []
         self.upstream.block = False
+        self.upstream.block_paths = None
+        self.upstream.capabilities = {}
         self.upstream.entered = threading.Event()
         self.upstream.release = threading.Event()
         self.upstream.decision = decision("finish", {"summary": "Done"})
@@ -147,6 +150,175 @@ class HTTPTests(unittest.TestCase):
         status, body = request(self.api, "/api/runs/" + run_id, token=self.cfg.dashboard_token)
         self.assertEqual(json.loads(body)["run"]["status"], "completed")
         self.assertEqual(request(self.api, "/api/screen", token=self.cfg.dashboard_token)[0], 200)
+
+    def configure_models(self):
+        self.cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                       ollama_token=self.proxy_token)
+        path = Path(self.temp.name) / "custom-config.toml"
+        path.write_text("# preserve local settings\n" + "\n".join(
+            f"{name} = {json.dumps(value)}" for name, value in dataclasses.asdict(self.cfg).items()) + "\n")
+        path.chmod(0o600)
+        self.agent.config = self.cfg
+        self.agent.config_file = path
+        self.agent.model = ModelClient(self.cfg)
+        self.proxy.models.add("qwen3-vl:8b")
+        return path
+
+    def test_dashboard_discovers_switches_and_saves_models_without_losing_run_history(self):
+        path = self.configure_models()
+        self.assertEqual(request(self.api, "/assets/model-selector.js")[0], 200)
+        self.assertEqual(request(self.api, "/api/models")[0], 401)
+        self.assertEqual(request(self.api, "/api/models", token=self.cfg.dashboard_token,
+                                 extra={"Origin": "https://attacker.example"})[0], 403)
+        status, body = request(self.api, "/api/models", token=self.cfg.dashboard_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"model": self.cfg.model,
+                         "models": ["qwen3-vl:30b-a3b-instruct", "qwen3-vl:8b"]})
+        self.assertNotIn(self.proxy_token.encode(), body)
+        first = self.agent.start("Use the original model")
+        self.agent.thread.join(2)
+        self.assertEqual(self.store.run(first)["status"], "completed")
+        self.assertTrue(self.proxy.inference.acquire(timeout=2))
+        self.proxy.inference.release()
+        controls = {"X-Treic-Agent": "1"}
+        selected = {"model": "qwen3-vl:8b"}
+        self.assertEqual(request(self.api, "/api/model", "POST", selected)[0], 401)
+        self.assertEqual(request(self.api, "/api/model", "POST", selected, self.cfg.dashboard_token)[0], 403)
+        self.assertEqual(request(self.api, "/api/model", "POST", selected, self.cfg.dashboard_token,
+                                 {**controls, "Origin": "https://attacker.example"})[0], 403)
+        status, body = request(self.api, "/api/model", "POST", selected, self.cfg.dashboard_token, controls)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body), selected)
+        self.assertEqual(load_config(path), dataclasses.replace(self.cfg, **selected))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertIn("# preserve local settings", path.read_text())
+        status, body = request(self.api, "/api/start", "POST", {"task": "Use the smaller model"},
+                               self.cfg.dashboard_token, controls)
+        self.assertEqual(status, 201, body)
+        second = json.loads(body)["run_id"]
+        self.agent.thread.join(2)
+        self.assertEqual(self.store.run(second)["status"], "completed")
+        self.assertEqual(self.store.run(first)["model"], self.cfg.model)
+        self.assertEqual(self.store.run(second)["model"], "qwen3-vl:8b")
+        self.assertEqual(self.upstream.payloads[-1]["model"], "qwen3-vl:8b")
+        restarted = Agent(load_config(path), self.store, self.agent.tools, config_file=path)
+        self.assertEqual(restarted.snapshot()["model"], "qwen3-vl:8b")
+        restarted.shutdown()
+
+    def test_failed_model_switches_preserve_current_model_and_configuration(self):
+        path = self.configure_models()
+        original, client = path.read_bytes(), self.agent.model
+        controls = {"X-Treic-Agent": "1"}
+        for name in (None, [], "bad model", "not-installed", "private-model"):
+            with self.subTest(name=name):
+                self.assertEqual(request(self.api, "/api/model", "POST", {"model": name},
+                                         self.cfg.dashboard_token, controls)[0], 400)
+        self.upstream.capabilities["qwen3-vl:8b"] = ["completion"]
+        status, body = request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                               self.cfg.dashboard_token, controls)
+        self.assertEqual(status, 400)
+        self.assertIn(b"vision", body)
+        with mock.patch("treics_agent.model.ModelClient.request", side_effect=ModelError("gateway offline")):
+            self.assertEqual(request(self.api, "/api/models", token=self.cfg.dashboard_token)[0], 502)
+            self.assertEqual(request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                                     self.cfg.dashboard_token, controls)[0], 502)
+        self.upstream.capabilities.clear()
+        with mock.patch("treics_agent.config.os.replace", side_effect=OSError("disk error")):
+            self.assertEqual(request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                                     self.cfg.dashboard_token, controls)[0], 400)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIs(self.agent.model, client)
+        self.assertEqual(self.agent.config, self.cfg)
+        self.assertFalse(self.agent.model_switching)
+
+    def test_model_changes_are_rejected_during_running_and_paused_tasks(self):
+        path = self.configure_models()
+        original = path.read_bytes()
+        model = FakeModel([decision("finish", {"summary": "Done"})])
+        model.release.clear()
+        self.agent.model = model
+        run_id = self.agent.start("Keep the original model for the entire task")
+        self.assertTrue(model.entered.wait(2))
+        controls = {"X-Treic-Agent": "1"}
+        for paused in (False, True):
+            if paused:
+                self.agent.pause()
+                model.release.set()
+                for _ in range(100):
+                    if self.store.run(run_id)["status"] == "paused":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(self.store.run(run_id)["status"], "paused")
+            status, body = request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                                   self.cfg.dashboard_token, controls)
+            self.assertEqual(status, 400)
+            self.assertIn(b"current task", body)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIs(self.agent.model, model)
+        self.agent.stop()
+        self.agent.thread.join(2)
+        self.assertEqual(self.store.run(run_id)["status"], "stopped")
+
+    def test_model_verification_keeps_status_and_stop_responsive_and_reserves_new_tasks(self):
+        path = self.configure_models()
+        original = path.read_bytes()
+        self.upstream.block = True
+        self.upstream.block_paths = {"/api/tags"}
+        controls = {"X-Treic-Agent": "1"}
+        result = []
+        worker = threading.Thread(target=lambda: result.append(request(self.api, "/api/model", "POST",
+                     {"model": "qwen3-vl:8b"}, self.cfg.dashboard_token, controls, timeout=8)))
+        worker.start()
+        try:
+            self.assertTrue(self.upstream.entered.wait(2))
+            status, body = request(self.api, "/api/state", token=self.cfg.dashboard_token, timeout=1)
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)["model_switching"])
+            self.assertFalse(json.loads(body)["task_active"])
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(request(self.api, "/api/start", "POST", {"task": "Wait for the selection"},
+                                     self.cfg.dashboard_token, controls, timeout=1)[0], 400)
+            self.assertEqual(request(self.api, "/api/model", "POST", {"model": self.cfg.model},
+                                     self.cfg.dashboard_token, controls, timeout=1)[0], 400)
+            self.assertEqual(request(self.api, "/api/stop", "POST", {}, self.cfg.dashboard_token,
+                                     controls, timeout=1)[0], 200)
+        finally:
+            self.upstream.release.set()
+            worker.join(8)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result[0][0], 200, result)
+        self.assertFalse(self.agent.model_switching)
+        self.assertEqual(load_config(path).model, "qwen3-vl:8b")
+
+    def test_discovery_during_inference_preserves_model_cancellation(self):
+        self.configure_models()
+        self.upstream.block = True
+        self.upstream.block_paths = {"/api/chat"}
+        run_id = self.agent.start("Keep stop working while listing models")
+        self.assertTrue(self.upstream.entered.wait(2))
+        client, connection = self.agent.model, self.agent.model.connection
+        status, _ = request(self.api, "/api/models", token=self.cfg.dashboard_token, timeout=1)
+        self.assertEqual(status, 200)
+        self.assertIs(client.connection, connection)
+        self.assertEqual(request(self.api, "/api/stop", "POST", {}, self.cfg.dashboard_token,
+                                 {"X-Treic-Agent": "1"}, timeout=1)[0], 200)
+        self.agent.thread.join(2)
+        self.assertFalse(self.agent.thread.is_alive())
+        self.assertEqual(self.store.run(run_id)["status"], "stopped")
+
+    def test_model_metadata_timeout_releases_switch_reservation_without_changing_config(self):
+        path = self.configure_models()
+        original, client = path.read_bytes(), self.agent.model
+        self.upstream.block = True
+        self.upstream.block_paths = {"/api/tags"}
+        started = time.monotonic()
+        status, body = request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                               self.cfg.dashboard_token, {"X-Treic-Agent": "1"}, timeout=8)
+        self.assertEqual(status, 502, body)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(self.agent.model_switching)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIs(self.agent.model, client)
 
     def test_status_cached_screen_and_controls_respond_while_desktop_is_locked(self):
         self.desktop.capture()

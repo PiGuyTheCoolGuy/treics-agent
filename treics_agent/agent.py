@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import threading
 import time
+from pathlib import Path
 
-from .config import Config
+from .config import Config, config_path, set_model, validate_model_name
 from .checklist import Checklist
 from .model import Cancelled, ModelClient, ModelError
 from .progress import ProgressGuard
@@ -18,8 +20,9 @@ TERMINAL_STATES = {"completed", "failed", "stopped", "limit_reached", "interrupt
 
 class Agent:
     def __init__(self, config: Config, store: Store, tools: Tools | None = None,
-                 model: ModelClient | None = None):
+                 model: ModelClient | None = None, config_file: Path | None = None):
         self.config = config
+        self.config_file = (config_file or config_path()).expanduser()
         self.store = store
         self.tools = tools or Tools(config, store)
         self.model = model or ModelClient(config)
@@ -31,6 +34,7 @@ class Agent:
         self.thread: threading.Thread | None = None
         self.current: str | None = None
         self.previewing = False
+        self.model_switching = False
         self.phase = "idle"
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
@@ -50,9 +54,41 @@ class Agent:
                     "task_checklist": self.config.task_checklist,
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
                     "workspace": str(self.config.work_path), "runs": self.store.runs(),
-                    "previewing": self.previewing}
+                    "previewing": self.previewing, "model_switching": self.model_switching,
+                    "task_active": bool(self.thread and self.thread.is_alive())}
         # Never hold the control lock while consulting desktop state.
         return {**result, **self.tools.desktop.snapshot()}
+
+    def available_models(self) -> dict:
+        with self.lock:
+            config = self.config
+        # Discovery must never overwrite the inference client's cancellable socket.
+        names = ModelClient(config).available_models()
+        with self.lock:
+            return {"model": self.config.model, "models": names}
+
+    def switch_model(self, name: str) -> dict:
+        validate_model_name(name)
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise ValueError("Finish or stop the current task before switching models.")
+            if self.model_switching:
+                raise ValueError("A model change is already in progress. Try again shortly.")
+            self.model_switching = True
+            config = self.config
+        try:
+            # Network checks and disk writes run without holding the dashboard control lock.
+            ModelClient(config).check_model(name)
+            selected = dataclasses.replace(config, model=name)
+            set_model(name, self.config_file)
+            with self.lock:
+                self.config = selected
+                self.model = ModelClient(selected)
+                self.last_model_seconds = None
+            return {"model": name}
+        finally:
+            with self.lock:
+                self.model_switching = False
 
     def capture_preview(self) -> dict:
         with self.lock:
@@ -72,6 +108,8 @@ class Agent:
         if type(max_steps) is not int or not 1 <= max_steps <= 10000:
             raise ValueError("max_steps must be an integer from 1 to 10000.")
         with self.lock:
+            if self.model_switching:
+                raise ValueError("A model change is being checked. Try starting the task again shortly.")
             if self.previewing:
                 raise ValueError("A desktop preview is being captured. Try starting the task again shortly.")
             if self.thread and self.thread.is_alive():

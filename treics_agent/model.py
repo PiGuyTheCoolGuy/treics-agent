@@ -9,6 +9,7 @@ import threading
 from urllib.parse import urlsplit
 
 from .config import Config
+from .checklist import CHECKLIST_PROMPT, ITEM_SCHEMA, UPDATES_SCHEMA
 
 
 TOOLS = {
@@ -28,6 +29,7 @@ TOOLS = {
     "wait": '{"seconds":number}: wait 0.1–30 seconds, then get a new screenshot.',
     "remember": '{"text":str}: replace persistent notes (max 6000 characters) used across future runs. Preserve useful existing notes; do not store credentials.',
     "finish": '{"summary":str}: state the actual result and any unresolved issue; this ends the run.',
+    "set_checklist": '{"items":[{"id":str,"title":str,"check":{"kind":str,"target":str,"expected":str}}],"revision_reason":str}: create/revise up to 8 concise requirements; preserve unchanged checks. Only available in checklist mode.',
 }
 
 def arguments_schema(required: dict, optional: dict | None = None) -> dict:
@@ -63,12 +65,20 @@ ARGUMENT_SCHEMAS = {
     "wait": arguments_schema({"seconds": {"type": "number", "minimum": 0.1, "maximum": 30}}),
     "remember": arguments_schema({"text": {"type": "string", "maxLength": 6000}}),
     "finish": arguments_schema({"summary": {"type": "string", "maxLength": 12000}}),
+    "set_checklist": arguments_schema({"items": {"type": "array", "items": ITEM_SCHEMA,
+                                                   "minItems": 1, "maxItems": 8},
+                                         "revision_reason": {"type": "string", "maxLength": 240}}),
 }
 
 
-def decision_schema(screen: dict | None = None) -> dict:
+def decision_schema(screen: dict | None = None, task_checklist: bool = False,
+                    require_checklist: bool = False) -> dict:
     cases = []
     for action, arguments in ARGUMENT_SCHEMAS.items():
+        if action == "set_checklist" and not task_checklist:
+            continue
+        if require_checklist and action not in {"set_checklist", "finish"}:
+            continue
         properties = {key: dict(schema) for key, schema in arguments["properties"].items()}
         if screen:
             for key in ("x", "end_x", "y", "end_y"):
@@ -80,6 +90,8 @@ def decision_schema(screen: dict | None = None) -> dict:
                                      "reason": {"type": "string", "maxLength": 600},
                                      "state": {"type": "string", "maxLength": 3000}},
                       "required": ["reason", "action", "arguments", "state"]})
+        if task_checklist:
+            cases[-1]["properties"]["checklist_updates"] = UPDATES_SCHEMA
     return {"type": "object", "required": ["reason", "action", "arguments", "state"], "anyOf": cases}
 
 
@@ -167,8 +179,8 @@ def validate_arguments(value, schema: dict, path: str) -> None:
             validate_arguments(child, schema["properties"][key], path + "." + key)
     elif kind == "array":
         if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
-            raise ModelError(f"{path} must contain {schema.get('minItems', 0)}–{schema['maxItems']} key names; "
-                             "omit optional paste_keys to use Ctrl+V.")
+            tip = "; omit optional paste_keys to use Ctrl+V" if path.endswith("paste_keys") else ""
+            raise ModelError(f"{path} must contain {schema.get('minItems', 0)}–{schema['maxItems']} items{tip}.")
         for child in value:
             validate_arguments(child, schema["items"], path + "[]")
     elif kind == "string":
@@ -181,7 +193,7 @@ def validate_arguments(value, schema: dict, path: str) -> None:
             raise ModelError(f"{path} is outside the allowed range.")
 
 
-def parse_decision(content: str) -> dict:
+def parse_decision(content: str, task_checklist: bool = False) -> dict:
     content = content.strip()
     if content.startswith("```") and content.endswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -189,16 +201,22 @@ def parse_decision(content: str) -> dict:
         obj = json.loads(content)
     except (ValueError, TypeError) as exc:
         raise ModelError("Model returned invalid JSON; return one schema-conforming object.") from exc
-    if not isinstance(obj, dict) or set(obj) != set(DECISION_SCHEMA["required"]):
+    required = set(DECISION_SCHEMA["required"])
+    optional = {"checklist_updates"} if task_checklist else set()
+    if not isinstance(obj, dict) or not required <= obj.keys() or obj.keys() - required - optional:
         raise ModelError("Decision requires exactly reason, action, arguments and state.")
     if not isinstance(obj["action"], str) or obj["action"] not in TOOLS:
         raise ModelError("Model selected an unknown action.")
+    if obj["action"] == "set_checklist" and not task_checklist:
+        raise ModelError("Task checklist mode is disabled.")
     if not isinstance(obj["arguments"], dict):
         raise ModelError("arguments must be an object.")
     for key, maximum in (("reason", 600), ("state", 3000)):
         if not isinstance(obj[key], str) or len(obj[key]) > maximum:
             raise ModelError(f"{key} must be a string of at most {maximum} characters.")
     validate_arguments(obj["arguments"], ARGUMENT_SCHEMAS[obj["action"]], obj["action"] + ".arguments")
+    if "checklist_updates" in obj:
+        validate_arguments(obj["checklist_updates"], UPDATES_SCHEMA, "checklist_updates")
     return obj
 
 
@@ -215,13 +233,15 @@ def observation_text(value: str, limit: int = 2000, omit_long_lines: bool = Fals
     return concise[:limit // 2] + "\n[output omitted]\n" + concise[-limit // 2:]
 
 
-def recent_observations(events: list[dict]) -> list[dict]:
+def recent_observations(events: list[dict], include_event_ids: bool = False) -> list[dict]:
     observations = []
     for event in events:
         if event["kind"] == "action_started":
             continue
         data = event["data"]
         observation = {"step": event["step"], "kind": event["kind"], "data": {}}
+        if include_event_ids and "id" in event:
+            observation["event_id"] = event["id"]
         details = observation["data"]
         result = data.get("result")
         failed = event["kind"] == "error" or (result is not None and result.get("ok") is False)
@@ -320,27 +340,36 @@ class ModelClient:
 
     def decide(self, task: str, state: str, memory: str, events: list[dict],
                screen: dict | None, stop: threading.Event,
-               budget: dict | None = None, filesystem: dict | None = None) -> tuple[dict, dict]:
-        tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items())
+               budget: dict | None = None, filesystem: dict | None = None,
+               checklist: list[dict] | None = None) -> tuple[dict, dict]:
+        tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
+                          if self.config.task_checklist or name != "set_checklist")
+        prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
         context = {
             "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
-            "recent_events": recent_observations(events),
+            "recent_events": recent_observations(events, self.config.task_checklist),
             "step_budget": budget,
             "filesystem": filesystem,
             "screen": ({k: v for k, v in screen.items() if k != "base64"} if screen else None),
             "task": task,
         }
+        if self.config.task_checklist:
+            # Preserve the original task as the final context field.
+            context.pop("task")
+            context["task_checklist"] = checklist or []
+            context["task"] = task
         user = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
         if screen:
             user["images"] = [screen["base64"]]
         payload = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT + "\nTools:\n" + tools +
+                {"role": "system", "content": prompt + "\nTools:\n" + tools +
                  '\nResponse shape: {"action":"tool name", "arguments":{tool-specific fields}, '
                  '"reason":"short description", "state":"observed progress and next step"}'}, user],
-            "format": decision_schema(screen), "stream": False,
+            "format": decision_schema(screen, self.config.task_checklist,
+                                      self.config.task_checklist and not checklist), "stream": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
                         "num_thread": self.config.num_thread, "num_predict": self.config.num_predict},
@@ -349,7 +378,7 @@ class ModelClient:
         if result.get("done_reason") == "length":
             raise ModelError("Model exceeded the response token limit; use a shorter action.")
         try:
-            decision = parse_decision(result["message"]["content"])
+            decision = parse_decision(result["message"]["content"], self.config.task_checklist)
         except (KeyError, TypeError) as exc:
             raise ModelError("Ollama returned no message content.") from exc
         metrics = {key: result[key] for key in ("total_duration", "load_duration", "prompt_eval_count",

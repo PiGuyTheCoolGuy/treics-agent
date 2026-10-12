@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 
 from .agent import Agent
-from .config import Config, config_path, initialize_config, load_config
+from .config import Config, config_path, initialize_config, load_config, set_task_checklist
 from .model import ModelClient
 from .server import AgentHTTPServer
 from .storage import Store
@@ -91,12 +91,18 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("task")
     run_parser.add_argument("--max-steps", type=int)
     commands.add_parser("memory", help="print saved cross-run notes")
+    checklist_parser = commands.add_parser("checklist", help="enable/disable the optional task checklist")
+    checklist_parser.add_argument("mode", choices=("on", "off"))
     args = parser.parse_args(argv)
     try:
         if args.config:
             os.environ["TREICS_AGENT_CONFIG"] = str(args.config.expanduser())
         if args.command == "init":
             print(initialize_config(args.config))
+            return 0
+        if args.command == "checklist":
+            path = set_task_checklist(args.mode == "on", args.config)
+            print(f"Task checklist {args.mode}: {path}. Restart the controller to apply.")
             return 0
         cfg = load_config(args.config)
         if args.command == "token":

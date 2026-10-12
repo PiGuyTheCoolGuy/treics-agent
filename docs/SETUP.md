@@ -89,6 +89,26 @@ Change the guest configuration to `model = "qwen3-vl:8b"`, restart the guest con
 
 The gateway limits context to 16,384 tokens, output to 4,096 tokens, threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
 
+### Optional task checklist experiment
+
+`task_checklist = false` is the default, including configurations created before this option existed. To test the progress aid, stop the current dashboard task and run **inside the guest**:
+
+```bash
+cd ~/treics-agent
+.venv/bin/treics-agent checklist on
+systemctl --user restart treics-agent
+```
+
+Use `checklist off` and restart again for a comparison without the aid. The command changes only that configuration setting; it preserves tokens and other settings. The dashboard displays the configured mode and each selected run's own checklist. New runs record their mode so earlier experiments remain identifiable.
+
+Enabled runs use one initial planning action to select up to eight concise requirements with explicit checks. The original task remains visible, and the model can revise, reorder, block, or reopen checks. The controller records pending, attempted, verified, and blocked states and updates matching checks automatically from actual tool results, without extra model calls for those updates. These checks persist beyond the recent-history window and include database event IDs for their evidence. Repeated identical plan submissions are treated as no progress.
+
+`verified` means the stated criterion passed, not that the whole task is correct. A `file_written` check confirms a write, a `file_read` check confirms an untruncated read from offset zero, and `directory_listed` confirms a file-tool listing. `command_succeeded` confirms exit code zero, not semantic correctness. `output_equals` and `output_contains` compare the observed shell output or file content against an explicit expected value. A model-chosen expected value can itself be wrong; independent correctness checks and human review are still needed.
+
+Optional progress updates can accompany an ordinary action, avoiding a separate action for each status change. The controller rejects nonexistent, future, foreign-run, or non-tool evidence and rejects verification based on failures, stale file reads, or newer contradicting observations before executing the proposed action. Recorded file writes reopen affected file-content/listing checks. Arbitrary shell side effects and semantic dependencies cannot be inferred automatically; the model must reopen checks when appropriate. Exiting with unverified checks remains allowed, and the dashboard summary lists them.
+
+For comparison, keep the original prompt, model options, starting files and step budget the same. Use separate output folders for each trial. The extra planning step and bounded checklist context are part of the experiment; disabling the mode removes its tools, progress fields and instructions from model requests. This feature is a planning aid, not an approval gate or a security boundary.
+
 ## 5. Stop, restart, update, and keep a baseline
 
 **Dashboard Stop** prevents the next action, cancels the model request, and kills the current shell process group. Pause waits for the current tool to return before stopping at the next action boundary. Stop does not undo earlier changes or kill background processes intentionally detached by previous commands.

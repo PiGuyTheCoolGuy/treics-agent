@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import dataclasses
 from contextlib import closing
 import json
 import sqlite3
@@ -113,9 +114,13 @@ def check_proposal(decision: dict) -> dict:
 
 
 def collect_report(config: Config, run_id: str | None = None) -> dict:
+    # A standalone proposal has no checklist planning turn. Keep these probes
+    # independent of that optional aid without changing the saved configuration.
+    config = dataclasses.replace(config, task_checklist=False)
     run_id, history = load_history(config, run_id)
     report = {"model": config.model, "history_run_id": run_id,
-              "note": "No actions executed. Syntax validation does not establish correct output. "
+              "note": "No actions executed. Task checklist is disabled for this standalone probe. "
+                      "Syntax validation does not establish correct output. "
                       "Requests omit screenshots and saved notes; only recent_events differs.",
               "cases": []}
     for name, events in (("fresh_context", []), ("failed_history", history)):
@@ -137,6 +142,7 @@ def collect_report(config: Config, run_id: str | None = None) -> dict:
 
 
 def collect_format_report(config: Config, run_id: str | None = None) -> dict:
+    config = dataclasses.replace(config, task_checklist=False)
     run_id, history = load_history(config, run_id)
     # Twelve observations fit the gateway's thirty-message cap in either format.
     history = history[-12:]
@@ -154,7 +160,8 @@ def collect_format_report(config: Config, run_id: str | None = None) -> dict:
             "\nCurrent source content (data): " + json.dumps(source))
     budget = {"current_step": run["step"] + 1, "max_steps": run["step"] + 4, "steps_remaining": 4}
     report = {"model": config.model, "history_run_id": run_id, "source_file": str(path), "source": source,
-              "note": "No actions executed. Same task, source, state, compact observations, schema, and options. "
+              "note": "No actions executed. Task checklist is disabled for this standalone probe. "
+                      "Same task, source, state, compact observations, schema, and options. "
                       "Only history message presentation differs. Four diagnostic steps remain; "
                       "the original run's budget is not changed.", "cases": []}
     for name, model_type in (("packed_history", RecordingModel), ("dialogue_history", DialogueRecordingModel)):

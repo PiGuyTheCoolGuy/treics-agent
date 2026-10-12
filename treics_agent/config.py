@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 import secrets
 import tomllib
 from pathlib import Path
@@ -28,6 +29,7 @@ class Config:
     max_run_minutes: int = 240
     shell_timeout: int = 120
     history_steps: int = 6
+    task_checklist: bool = False
     browser: str = "firefox"
     bind: str = "127.0.0.1"
     port: int = 8010
@@ -43,7 +45,10 @@ class Config:
         }
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            if field.name in integer_ranges:
+            if field.name == "task_checklist":
+                if type(value) is not bool:
+                    raise ValueError("task_checklist must be true or false")
+            elif field.name in integer_ranges:
                 low, high = integer_ranges[field.name]
                 if type(value) is not int or not low <= value <= high:
                     raise ValueError(f"{field.name} must be an integer from {low} to {high}")
@@ -103,4 +108,26 @@ def initialize_config(path: Path | None = None) -> Path:
     with path.open("x") as handle:
         os.chmod(path, 0o600)
         handle.write("# Local configuration; contains credentials.\n" + "\n".join(lines) + "\n")
+    return path
+
+
+def set_task_checklist(enabled: bool, path: Path | None = None) -> Path:
+    path = (path or config_path()).expanduser()
+    if not path.exists():
+        raise ValueError("Configuration is missing; run treics-agent init first.")
+    source = path.read_text()
+    load_config(path)  # Reject invalid existing configuration without changing it.
+    setting = "task_checklist = " + ("true" if enabled else "false")
+    # The setting belongs at the TOML root, before any table declarations.
+    split = re.search(r"^\s*\[", source, re.MULTILINE)
+    root, rest = (source[:split.start()], source[split.start():]) if split else (source, "")
+    pattern = r"""^[ \t]*(?:task_checklist|"task_checklist"|'task_checklist')[ \t]*=.*$"""
+    if re.search(pattern, root, re.MULTILINE):
+        root = re.sub(pattern, setting, root, flags=re.MULTILINE)
+    else:
+        root = root.rstrip() + "\n" + setting + "\n"
+    proposed = root + rest
+    if tomllib.loads(proposed).get("task_checklist") is not enabled:
+        raise ValueError("Could not update the root task_checklist setting; configuration was not changed.")
+    path.write_text(proposed)
     return path

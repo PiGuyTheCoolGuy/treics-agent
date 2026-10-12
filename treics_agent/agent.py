@@ -6,6 +6,7 @@ import threading
 import time
 
 from .config import Config
+from .checklist import Checklist
 from .model import Cancelled, ModelClient, ModelError
 from .progress import ProgressGuard
 from .storage import Store
@@ -45,6 +46,7 @@ class Agent:
                     "phase": self.phase, "phase_started": self.phase_started,
                     "last_model_seconds": self.last_model_seconds,
                     "pause_reason": self.pause_reason,
+                    "task_checklist": self.config.task_checklist,
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
                     "workspace": str(self.config.work_path), "runs": self.store.runs()}
 
@@ -60,7 +62,8 @@ class Agent:
             self.stop_event.clear()
             self.paused = False
             self.pause_reason = None
-            self.current = self.store.create_run(task.strip(), max_steps, self.config.model)
+            self.current = self.store.create_run(task.strip(), max_steps, self.config.model, self.config.task_checklist)
+            self.tools.run_id = self.current
             self.tools.desktop.run_directory = self.config.data_path / "runs" / self.current
             self.set_phase("starting")
             self.thread = threading.Thread(target=self._run, args=(self.current,), daemon=True,
@@ -115,8 +118,9 @@ class Agent:
                 raise TimeoutError("Run time limit reached.")
 
     def _context_events(self, run_id: str) -> list[dict]:
-        events = [e for e in self.store.events(run_id, self.config.history_steps * 3)
-                  if e['kind'] != 'action_started'][-self.config.history_steps:]
+        multiplier = 4 if self.config.task_checklist else 3
+        events = [e for e in self.store.events(run_id, self.config.history_steps * multiplier)
+                  if e['kind'] not in {'action_started', 'checklist_updated'}][-self.config.history_steps:]
         events = copy.deepcopy(events)
         for event in events:
             # Keep logs complete on disk, but avoid re-sending giant scripts/output every step.
@@ -151,6 +155,7 @@ class Agent:
         errors = 0
         screen = None
         progress = ProgressGuard()
+        checklist = Checklist(self.store, run_id, self.config.work_path) if run["task_checklist"] else None
         try:
             self._gate(deadline)
             self.set_phase("observing")
@@ -161,29 +166,48 @@ class Agent:
                 self.set_phase("model")
                 started = time.monotonic()
                 decision = None
+                action_dispatched = False
                 try:
                     context_events = self._context_events(run_id)
+                    checklist_context = {"checklist": checklist.snapshot()} if checklist else {}
                     decision, metrics = self.model.decide(
                         run["task"], self.store.run(run_id)["state"], self.store.memory(),
                         context_events, screen, self.stop_event,
                         budget={"current_step": step, "max_steps": run["max_steps"],
                                 "steps_remaining": run["max_steps"] - step + 1},
-                        filesystem=self.tools.filesystem_context(context_events))
+                        filesystem=self.tools.filesystem_context(context_events), **checklist_context)
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
                     self._gate(deadline)
+                    if checklist:
+                        if not checklist.snapshot() and decision["action"] not in {"set_checklist", "finish"}:
+                            raise ModelError("Create the checklist with set_checklist before starting task tools.")
+                        if updates := decision.get("checklist_updates"):
+                            if checklist.apply_updates(updates):
+                                self.store.event(run_id, step, "checklist_updated",
+                                                 {"items": checklist.snapshot(), "message": "Evidence-checked progress update."})
                     self.set_phase("action")
                     self.store.event(run_id, step, "action_started", {"decision": decision})
+                    action_dispatched = True
                     result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
                     if result.get("ok", False) and not result.get("skipped", False):
                         self.store.update(run_id, state=decision["state"])
-                    self.store.event(run_id, step, "action", {"decision": decision, "result": result,
-                                                             "model_seconds": self.last_model_seconds,
-                                                             "metrics": metrics})
+                    action_data = {"decision": decision, "result": result,
+                                   "model_seconds": self.last_model_seconds, "metrics": metrics}
+                    event_id = self.store.event(run_id, step, "action", action_data)
+                    if checklist and checklist.observe({"id": event_id, "kind": "action", "data": action_data}):
+                        self.store.event(run_id, step, "checklist_updated",
+                                         {"items": checklist.snapshot(), "message": "Progress observed from tool results."})
                     errors = 0 if result.get("ok", False) else errors + 1
                     if decision["action"] == "finish":
-                        self.store.update(run_id, status="completed", summary=result["summary"])
+                        summary = result["summary"]
+                        if checklist:
+                            remaining = [item for item in checklist.snapshot() if item["status"] != "verified"]
+                            if remaining:
+                                summary += "\n\nUnverified checklist requirements: " + "; ".join(
+                                    item["title"] + " (" + item["status"] + ")" for item in remaining)
+                        self.store.update(run_id, status="completed", summary=summary)
                         return
                     previous_screen = screen
                     if decision["action"] in self.tools.GUI_ACTIONS:
@@ -211,7 +235,13 @@ class Agent:
                     if decision:
                         error_data["decision"] = decision
                         error_data["message"] = decision["action"] + " failed: " + message
-                    self.store.event(run_id, step, "error", error_data)
+                        if not action_dispatched:
+                            error_data["action_executed"] = False
+                            error_data["message"] = "Decision rejected before tool execution: " + message
+                    event_id = self.store.event(run_id, step, "error", error_data)
+                    if checklist and checklist.observe({"id": event_id, "kind": "error", "data": error_data}):
+                        self.store.event(run_id, step, "checklist_updated",
+                                         {"items": checklist.snapshot(), "message": "Recorded unsuccessful attempt."})
                     if isinstance(exc, (ToolError, OSError)):
                         screen = None
                         self.tools.desktop.frame = None

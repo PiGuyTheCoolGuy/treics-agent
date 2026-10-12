@@ -174,6 +174,10 @@ class HTTPTests(unittest.TestCase):
         cases = {c["properties"]["action"]["enum"][0]: c for c in payload["format"]["anyOf"]}
         self.assertIn("finish", cases)
         self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 767)
+        # The simulated model answers immediately; wait for the gateway's
+        # request cleanup before sending another inference request.
+        self.assertTrue(self.proxy.inference.acquire(timeout=2))
+        self.proxy.inference.release()
         client.decide("Test task", "state", "notes", [], None, threading.Event())
         self.assertNotIn("images", self.upstream.payloads[-1]["messages"][1])
 
@@ -183,6 +187,42 @@ class HTTPTests(unittest.TestCase):
         self.upstream.decision = decision("type", {"text": "https://example.com", "paste_keys": []})
         with self.assertRaisesRegex(ModelError, "type.arguments.paste_keys"):
             ModelClient(cfg).decide("Type", "", "", [], self.desktop.capture(), threading.Event())
+
+    def test_checklist_mode_adds_plan_schema_and_evidence_context_only_when_enabled(self):
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                  ollama_token=self.proxy_token, task_checklist=True)
+        client = ModelClient(cfg)
+        task = "List the source directory, write the report, then verify it"
+        client.decide(task, "", "", [], None, threading.Event(), checklist=[])
+        payload = self.upstream.payloads[-1]
+        cases = {c["properties"]["action"]["enum"][0]: c for c in payload["format"]["anyOf"]}
+        self.assertEqual(set(cases), {"set_checklist", "finish"})
+        self.assertIn("checklist_updates", cases["finish"]["properties"])
+        self.assertIn("checklist mode is ON", payload["messages"][0]["content"])
+        self.assertTrue(self.proxy.inference.acquire(timeout=2))
+        self.proxy.inference.release()
+        items = [{"id": "list", "title": "List source", "check": {"kind": "directory_listed", "target": "source", "expected": ""},
+                  "status": "verified", "evidence_ids": [9], "note": ""}]
+        events = [{"id": 9, "step": 2, "kind": "action", "data": {
+            "decision": decision("list_files", {"path": "source"}),
+            "result": {"ok": True, "entries": [], "path": "source"}}}]
+        client.decide(task, "", "", events, None, threading.Event(), checklist=items)
+        payload = self.upstream.payloads[-1]
+        context = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(context["task_checklist"], items)
+        self.assertEqual(context["recent_events"][0]["event_id"], 9)
+        self.assertEqual(list(context)[-1], "task")
+        self.assertIn("shell", {c["properties"]["action"]["enum"][0] for c in payload["format"]["anyOf"]})
+        self.assertTrue(self.proxy.inference.acquire(timeout=2))
+        self.proxy.inference.release()
+        off = ModelClient(dataclasses.replace(cfg, task_checklist=False))
+        off.decide(task, "", "", events, None, threading.Event(), checklist=items)
+        payload = self.upstream.payloads[-1]
+        context = json.loads(payload["messages"][1]["content"])
+        self.assertNotIn("task_checklist", context)
+        self.assertNotIn("event_id", context["recent_events"][0])
+        self.assertNotIn("set_checklist", payload["messages"][0]["content"])
+        self.assertTrue(all("checklist_updates" not in c["properties"] for c in payload["format"]["anyOf"]))
 
     def test_model_context_uses_observed_results_and_keeps_current_task_last(self):
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
@@ -218,14 +258,17 @@ class HTTPTests(unittest.TestCase):
         target = Path(self.temp.name) / "must-not-exist.py"
         self.upstream.decision = decision("write_file", {"path": str(target), "content": "print('Example Domain')\n"})
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
-                                   ollama_token=self.proxy_token)
+                                   ollama_token=self.proxy_token, task_checklist=True)
         before = self.store.run(run_id)
         report = diagnostic_module.collect_report(cfg, run_id)
+        self.assertTrue(cfg.task_checklist)
+        self.assertIn("checklist is disabled", report["note"])
         self.assertEqual(self.store.run(run_id), before)
         self.assertFalse(target.exists())
         self.assertEqual(len(report["cases"]), 2)
         self.assertTrue(all(case["validation"]["syntax_valid"] for case in report["cases"]))
         fresh, history = [case["request"] for case in report["cases"]]
+        self.assertIn("write_file", {c["properties"]["action"]["enum"][0] for c in fresh["format"]["anyOf"]})
         fresh_context = json.loads(fresh["messages"][1]["content"])
         history_context = json.loads(history["messages"][1]["content"])
         self.assertEqual(fresh_context["recent_events"], [])

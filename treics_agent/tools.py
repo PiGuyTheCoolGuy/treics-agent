@@ -16,7 +16,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import Config
-from .model import Cancelled
+from .model import ARGUMENT_SCHEMAS, Cancelled, validate_arguments
+from .checklist import Checklist
 from .storage import Store
 
 
@@ -115,6 +116,7 @@ class Tools:
         "write_file": ({"path", "content"}, set()), "list_files": (set(), {"path"}),
         "open_browser": ({"url"}, set()), "wait": ({"seconds"}, set()),
         "remember": ({"text"}, set()), "finish": ({"summary"}, set()),
+        "set_checklist": ({"items", "revision_reason"}, set()),
     }
 
     def __init__(self, config: Config, store: Store, desktop: Desktop | None = None):
@@ -124,6 +126,7 @@ class Tools:
         self.config.work_path.mkdir(parents=True, exist_ok=True)
         self.process_lock = threading.Lock()
         self.process: subprocess.Popen | None = None
+        self.run_id: str | None = None
 
     @staticmethod
     def kill(process: subprocess.Popen) -> None:
@@ -292,6 +295,14 @@ class Tools:
             raise ToolError("Unexpected arguments: " + ", ".join(sorted(extra)))
         a = arguments
         d = self.desktop
+        if action == "set_checklist":
+            if not self.config.task_checklist or not self.run_id:
+                raise ToolError("Task checklist mode is disabled or no task is active.")
+            validate_arguments(a, ARGUMENT_SCHEMAS[action], "set_checklist.arguments")
+            checklist = Checklist(self.store, self.run_id, self.config.work_path)
+            changed = checklist.set_items(a["items"], a["revision_reason"])
+            return {"ok": True, "skipped": not changed, "items": checklist.snapshot(),
+                    "message": "Checklist saved." if changed else "Checklist unchanged; continue with task work."}
         if action == "shell":
             return self.shell(a, stop)
         if action == "read_file":

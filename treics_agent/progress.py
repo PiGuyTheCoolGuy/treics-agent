@@ -48,7 +48,10 @@ class ProgressGuard:
                 before: dict | None, after: dict | None) -> str | None:
         self.recent_errors.append(None)
         action = decision["action"]
-        signature = json.dumps([action, decision["arguments"]], sort_keys=True, ensure_ascii=False)
+        arguments = decision["arguments"]
+        if action == "set_checklist":
+            arguments = {key: value for key, value in arguments.items() if key != "revision_reason"}
+        signature = json.dumps([action, arguments], sort_keys=True, ensure_ascii=False)
         if action in Tools.GUI_ACTIONS:
             self.last_text_result = None
             if not self.same_screen(before, after):
@@ -70,9 +73,10 @@ class ProgressGuard:
                 self._reset_attempts()
             self.last_text_result = fingerprint
             evidence = "the tool returned the same result"
-        elif action == "write_file" and result.get("skipped"):
+        elif action in {"write_file", "set_checklist"} and result.get("skipped"):
             self.last_text_result = None
-            evidence = "the file already contained exactly the requested content"
+            evidence = ("the file already contained exactly the requested content" if action == "write_file" else
+                        "the checklist already contained the same requirements")
         else:
             self.reset()
             return None

@@ -59,13 +59,15 @@ class FakeModel:
         self.events = []
         self.states = []
         self.filesystems = []
+        self.checklists = []
 
-    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None):
+    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)
         self.states.append(state)
         self.filesystems.append(filesystem)
+        self.checklists.append(checklist)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)

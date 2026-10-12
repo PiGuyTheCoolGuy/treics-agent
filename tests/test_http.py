@@ -245,6 +245,37 @@ class HTTPTests(unittest.TestCase):
         review = diagnostic_module.check_proposal(decision("write_file", {"path": "x.py", "content": "import sys; class P: pass"}))
         self.assertFalse(review["syntax_valid"])
 
+    def test_recovery_format_comparison_preserves_evidence_source_and_run(self):
+        run_id = self.store.create_run("Fix the attribute, then print False", 6, self.cfg.model)
+        self.store.update(run_id, step=6, state="Script written; next run it", status="limit_reached")
+        self.store.event(run_id, 3, "action", {"decision": decision("shell", {"command": "python3 parser.py"}),
+                                               "result": {"ok": False, "output": "NameError: parser"}})
+        self.cfg.work_path.mkdir(parents=True, exist_ok=True)
+        path = self.cfg.work_path / "parser.py"
+        original = "print(parser.in_paragraph)\nparser.in_paragraph = False\n"
+        path.write_text(original)
+        self.upstream.decision = decision("write_file", {"path": str(path), "content": "print(False)\n"})
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        before = self.store.run(run_id)
+        report = diagnostic_module.collect_format_report(cfg, run_id)
+        self.assertEqual(path.read_text(), original)
+        self.assertEqual(self.store.run(run_id), before)
+        packed, dialogue = [case["request"] for case in report["cases"]]
+        for key in ("model", "format", "options", "stream"):
+            self.assertEqual(packed[key], dialogue[key])
+        self.assertEqual(packed["messages"][0], dialogue["messages"][0])
+        current = json.loads(packed["messages"][1]["content"])
+        history = current["recent_events"]
+        self.assertEqual(dialogue["messages"][1]["role"], "assistant")
+        prior = json.loads(dialogue["messages"][1]["content"])
+        observed = json.loads(dialogue["messages"][2]["content"])
+        self.assertEqual(prior["previous_action"], history[0]["data"]["action"])
+        self.assertEqual(observed["observation"]["result"], history[0]["data"]["result"])
+        current["recent_events"] = []
+        self.assertEqual(current, json.loads(dialogue["messages"][-1]["content"]))
+        self.assertIn(original, report["source"])
+
     def test_dashboard_exposes_automatic_pause_reason_and_resume_control(self):
         self.agent.model = FakeModel([decision("screenshot", {})] * 3 +
                                      [decision("finish", {"summary": "Recovered"})])

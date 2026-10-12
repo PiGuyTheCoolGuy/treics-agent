@@ -48,7 +48,8 @@ class Agent:
                     "pause_reason": self.pause_reason,
                     "task_checklist": self.config.task_checklist,
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
-                    "workspace": str(self.config.work_path), "runs": self.store.runs()}
+                    "workspace": str(self.config.work_path), "runs": self.store.runs(),
+                    **self.tools.desktop.snapshot()}
 
     def start(self, task: str, max_steps: int | None = None) -> str:
         if not isinstance(task, str) or not task.strip() or len(task) > 12000:
@@ -213,7 +214,10 @@ class Agent:
                     if decision["action"] in self.tools.GUI_ACTIONS:
                         self._gate(deadline)
                         self.set_phase("observing")
-                        screen = self.tools.desktop.capture()
+                        if decision["action"] == "zoom_screenshot":
+                            screen = self.tools.desktop.capture(result["capture_region"])
+                        else:
+                            screen = self.tools.desktop.capture()
                     else:
                         screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
@@ -279,3 +283,6 @@ class Agent:
         self.stop()
         if self.thread:
             self.thread.join(timeout=15)
+        if not self.thread or not self.thread.is_alive():
+            with self.tools.desktop.lock:
+                self.tools.desktop.marker.close()

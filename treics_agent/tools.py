@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import re
 import selectors
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import Config
+from .click_marker import ClickMarker
 from .model import ARGUMENT_SCHEMAS, Cancelled, validate_arguments
 from .checklist import Checklist
 from .storage import Store
@@ -44,6 +46,9 @@ class Desktop:
         self.frame: dict | None = None
         self.image: bytes | None = None
         self.run_directory: Path | None = None
+        self.last_click: dict | None = None
+        self.marker = ClickMarker(config)
+        self.marker_error: str | None = None
 
     def command(self, args: list[str], **kwargs) -> subprocess.CompletedProcess:
         try:
@@ -57,22 +62,106 @@ class Desktop:
         except subprocess.TimeoutExpired as exc:
             raise ToolError(f"Desktop command {args[0]} timed out.") from exc
 
-    def capture(self) -> dict:
-        from PIL import Image
+    @staticmethod
+    def jpeg(image) -> bytes:
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85)
+        return output.getvalue()
+
+    def zoom_region(self, arguments: dict) -> dict:
+        """Translate a rectangle in the current image into native desktop pixels."""
+        if not self.frame:
+            raise ToolError("No current screenshot. Use screenshot before zoom_screenshot.")
+        frame = self.frame
+        x = number(arguments["x"], "x", 0, frame["width"] - 1, True)
+        y = number(arguments["y"], "y", 0, frame["height"] - 1, True)
+        width = number(arguments["width"], "width", 1, frame["width"] - x, True)
+        height = number(arguments["height"], "height", 1, frame["height"] - y, True)
+        scale = number(arguments.get("scale", 3), "scale", 2, 6, True)
+        source = frame.get("source", {"x": 0, "y": 0, "width": frame["desktop_width"],
+                                     "height": frame["desktop_height"]})
+        left = source["x"] + math.floor(x * source["width"] / frame["width"])
+        top = source["y"] + math.floor(y * source["height"] / frame["height"])
+        right = source["x"] + math.ceil((x + width) * source["width"] / frame["width"])
+        bottom = source["y"] + math.ceil((y + height) * source["height"] / frame["height"])
+        return {"x": left, "y": top, "width": right - left, "height": bottom - top,
+                "scale": scale, "desktop_width": frame["desktop_width"],
+                "desktop_height": frame["desktop_height"]}
+
+    def record_click(self, x: int, y: int, button: str, clicks: int, source: dict) -> dict:
+        self.last_click = {"x": x, "y": y, "button": button, "clicks": clicks,
+                           "clicked_at": time.time(), "source": source}
+        try:
+            self.marker.show(x, y)
+            self.marker_error = None
+        except Exception as exc:
+            # Drawing failure must never turn a completed click into a retry.
+            self.marker_error = str(exc)[:300]
+            self.marker.close()
+        return dict(self.last_click)
+
+    def pointer_coordinates(self) -> tuple[int, int]:
+        location = self.command(["xdotool", "getmouselocation", "--shell"])
+        values = dict(line.split("=", 1) for line in location.stdout.decode().splitlines() if "=" in line)
+        try:
+            return int(values["X"]), int(values["Y"])
+        except (KeyError, ValueError) as exc:
+            raise ToolError("Could not read the desktop pointer location; no click was sent.") from exc
+
+    def move_pointer(self, x: int, y: int) -> None:
+        # xdotool --sync waits for movement, even if the pointer is already there.
+        if self.pointer_coordinates() != (x, y):
+            self.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"last_click": dict(self.last_click) if self.last_click else None,
+                    "click_marker_error": self.marker_error,
+                    "screen": {k: v for k, v in self.frame.items() if k != "base64"} if self.frame else None}
+
+    def capture(self, region: dict | None = None) -> dict:
+        from PIL import Image, ImageDraw
 
         with self.lock, tempfile.TemporaryDirectory(prefix="treic-screen-") as directory:
             path = Path(directory) / "screen.png"
-            self.command(["scrot", "-o", str(path)])
+            with self.marker.hidden():
+                self.command(["scrot", "-o", str(path)])
             with Image.open(path) as original:
                 screen_width, screen_height = original.size
                 image = original.convert("RGB")
+                source = {"x": 0, "y": 0, "width": screen_width, "height": screen_height}
+                view = image
+                if region:
+                    if (screen_width, screen_height) != (region["desktop_width"], region["desktop_height"]):
+                        self.frame = None
+                        raise ToolError("Desktop resolution changed. Use screenshot before zooming again.")
+                    source = {key: region[key] for key in ("x", "y", "width", "height")}
+                    view = image.crop((source["x"], source["y"], source["x"] + source["width"],
+                                       source["y"] + source["height"]))
+                    factor = min(region["scale"], self.config.screen_width / view.width,
+                                 self.config.screen_height / view.height)
+                    view = view.resize((max(1, round(view.width * factor)), max(1, round(view.height * factor))),
+                                       Image.Resampling.LANCZOS)
+                else:
+                    view = image.copy()
+                    view.thumbnail((self.config.screen_width, self.config.screen_height), Image.Resampling.LANCZOS)
+                # Human previews always show the full desktop, with an annotation.
                 image.thumbnail((self.config.screen_width, self.config.screen_height), Image.Resampling.LANCZOS)
-                output = io.BytesIO()
-                image.save(output, format="JPEG", quality=85)
-                self.image = output.getvalue()
-                self.frame = {"width": image.width, "height": image.height,
+                if self.last_click:
+                    cx = round(self.last_click["x"] * image.width / screen_width)
+                    cy = round(self.last_click["y"] * image.height / screen_height)
+                    draw = ImageDraw.Draw(image)
+                    draw.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), outline="white", width=4)
+                    draw.ellipse((cx - 10, cy - 10, cx + 10, cy + 10), outline="#ff4040", width=2)
+                    for line in ((cx - 20, cy, cx - 14, cy), (cx + 14, cy, cx + 20, cy),
+                                 (cx, cy - 20, cx, cy - 14), (cx, cy + 14, cx, cy + 20)):
+                        draw.line(line, fill="white", width=4)
+                        draw.line(line, fill="#ff4040", width=2)
+                self.image = self.jpeg(image)
+                self.frame = {"width": view.width, "height": view.height,
                               "desktop_width": screen_width, "desktop_height": screen_height,
-                              "captured_at": time.time(), "base64": base64.b64encode(self.image).decode()}
+                              "view": "zoom" if region else "desktop", "source": source,
+                              "captured_at": time.time(), "base64": base64.b64encode(self.jpeg(view)).decode()}
             if self.run_directory:
                 self.run_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 temporary = self.run_directory / "screen.tmp"
@@ -86,8 +175,10 @@ class Desktop:
         frame = self.frame
         x = number(x, "x", 0, frame["width"] - 1, integer=True)
         y = number(y, "y", 0, frame["height"] - 1, integer=True)
-        return (min(frame["desktop_width"] - 1, round(x * frame["desktop_width"] / frame["width"])),
-                min(frame["desktop_height"] - 1, round(y * frame["desktop_height"] / frame["height"])))
+        source = frame.get("source", {"x": 0, "y": 0, "width": frame["desktop_width"],
+                                     "height": frame["desktop_height"]})
+        return (min(source["x"] + source["width"] - 1, source["x"] + round(x * source["width"] / frame["width"])),
+                min(source["y"] + source["height"] - 1, source["y"] + round(y * source["height"] / frame["height"])))
 
     @staticmethod
     def key_combination(keys: list[str]) -> str:
@@ -105,10 +196,12 @@ class Desktop:
 
 
 class Tools:
-    GUI_ACTIONS = {"screenshot", "click", "move", "drag", "scroll", "type", "press", "hotkey",
+    GUI_ACTIONS = {"screenshot", "zoom_screenshot", "click", "move", "drag", "scroll", "type", "press", "hotkey",
                    "open_browser", "wait"}
     ARGS = {
-        "screenshot": (set(), set()), "click": ({"x", "y"}, {"button", "clicks"}),
+        "screenshot": (set(), set()),
+        "zoom_screenshot": ({"x", "y", "width", "height"}, {"scale"}),
+        "click": ({"x", "y"}, {"button", "clicks"}),
         "move": ({"x", "y"}, set()), "drag": ({"x", "y", "end_x", "end_y"}, {"duration"}),
         "scroll": ({"amount"}, {"x", "y"}), "type": ({"text"}, {"paste_keys"}),
         "press": ({"key"}, set()), "hotkey": ({"keys"}, set()),
@@ -349,24 +442,41 @@ class Tools:
         if action == "finish":
             return {"ok": True, "summary": text(a["summary"], "summary", 12000)}
         with d.lock:
+            result = {"ok": True, "message": f"{action} completed; a full desktop screen will be captured."}
+            if action == "zoom_screenshot":
+                region = d.zoom_region(a)
+                return {"ok": True, "capture_region": region,
+                        "message": "A fresh zoomed image will be attached next. Use its local pixel coordinates "
+                                   "for click/move/drag/scroll; the controller adds the crop offset and "
+                                   "handles scaling. The next ordinary GUI action restores the full view."}
             if action in ("click", "move", "drag"):
                 x, y = d.coordinates(a["x"], a["y"])
-                d.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
                 if action == "click":
                     button = a.get("button", "left")
                     if button not in ("left", "right", "middle"):
                         raise ToolError("button must be left, right or middle.")
                     clicks = number(a.get("clicks", 1), "clicks", 1, 2, True)
-                    d.command(["xdotool", "click", "--repeat", str(clicks), "--delay", "100",
-                               str({"left": 1, "middle": 2, "right": 3}[button])])
                 elif action == "drag":
                     end_x, end_y = d.coordinates(a["end_x"], a["end_y"])
                     duration = number(a.get("duration", 0.6), "duration", 0.1, 5)
+                d.move_pointer(x, y)
+                if action == "click":
+                    pointer_x, pointer_y = d.pointer_coordinates()
+                    d.command(["xdotool", "click", "--repeat", str(clicks), "--delay", "100",
+                               str({"left": 1, "middle": 2, "right": 3}[button])])
+                    result["last_click"] = d.record_click(pointer_x, pointer_y, button, clicks,
+                                                         {"x": a["x"], "y": a["y"],
+                                                          "mapped_x": x, "mapped_y": y,
+                                                          "view": d.frame.get("view", "desktop"),
+                                                          "region": d.frame.get("source")})
+                    if d.marker_error:
+                        result["click_marker_error"] = d.marker_error
+                elif action == "drag":
                     d.command(["xdotool", "mousedown", "1"])
                     try:
                         if stop.wait(duration / 2):
                             raise Cancelled()
-                        d.command(["xdotool", "mousemove", "--sync", str(end_x), str(end_y)])
+                        d.move_pointer(end_x, end_y)
                         if stop.wait(duration / 2):
                             raise Cancelled()
                     finally:
@@ -377,7 +487,7 @@ class Tools:
                     raise ToolError("Provide both x and y, or neither.")
                 if "x" in a:
                     x, y = d.coordinates(a["x"], a["y"])
-                    d.command(["xdotool", "mousemove", "--sync", str(x), str(y)])
+                    d.move_pointer(x, y)
                 if amount:
                     d.command(["xdotool", "click", "--repeat", str(abs(amount)), "--delay", "30",
                                "4" if amount > 0 else "5"])
@@ -410,4 +520,4 @@ class Tools:
                 raise ToolError("Unsupported action.")
             if stop.wait(0.25):
                 raise Cancelled()
-            return {"ok": True, "message": f"{action} completed; screen will be captured."}
+            return result

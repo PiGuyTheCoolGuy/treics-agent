@@ -31,7 +31,11 @@ Successful execution verifies only an execution criterion. It cannot independent
 
 Each decision also receives fresh metadata for the workspace and up to eleven recently referenced file/working-directory paths, including failed actions' paths. A shallow workspace listing is capped at twenty entries; metadata also has a character cap and reports omitted paths/entries. It does not read file contents or recurse. This lets the model distinguish a historical missing-directory error from the current existence of that directory. The diagnostic probes leave this optional live context absent to keep their comparisons controlled.
 
-For shell/file/note actions the next prompt omits images, and previous coordinates are invalidated. The model requests a screenshot before returning to coordinate actions. Screenshot coordinates are mapped to the actual desktop when the image is downscaled.
+For shell/file/note actions the next prompt omits images, and previous coordinates are invalidated. The model requests a screenshot before returning to coordinate actions. Each frame records its native desktop source rectangle. Screenshot coordinates are mapped through that rectangle when the image is downscaled or enlarged.
+
+`zoom_screenshot` takes a bounded rectangle in the latest image, translates it to desktop coordinates (including any existing crop), and captures a fresh native screenshot before cropping and enlarging it. Output stays within the configured image budget. Coordinate tools use the resulting image's local coordinates; another ordinary GUI action or `screenshot` returns to the full view. Crop changes count as observation changes for loop detection. A desktop resolution change invalidates a pending crop rather than silently reusing its mapping.
+
+Successful clicks record source-image, mapped-desktop, and pre-click pointer coordinates. The live marker uses two small override-redirect X11 windows with hollow bounding shapes and empty SHAPE input regions. It cannot intercept mouse events or request keyboard focus. Capture temporarily unmaps it, then restores it. Model images remain clean; the human dashboard and saved `screen.jpg` receive a separate last-click annotation and always show the full desktop. Overlay setup failures are reported without treating an already executed click as failed. Closing the controller's X11 connection destroys the marker.
 
 Shell commands run with Bash `pipefail`, so a failed extraction or download inside a pipeline is not hidden by a successful final command. A shell action's proposed state is saved only when the command succeeds; its exit status and output remain in the activity log either way.
 
@@ -61,7 +65,7 @@ Repeated errors are tracked separately: three matching action/error messages wit
 
 ## Local development
 
-The controller requires Python 3.11+ and Pillow. The desktop tools are `scrot`, `xdotool` and `xclip`. Linux X11 is required; this implementation does not control Windows or Wayland.
+The controller requires Python 3.11+, Pillow, and python-xlib. The desktop tools are `scrot`, `xdotool` and `xclip`. The click-through live marker uses the SHAPE 1.1 extension provided by Xvfb. Linux X11 is required; this implementation does not control Windows or Wayland.
 
 ```bash
 python3 -m venv .venv

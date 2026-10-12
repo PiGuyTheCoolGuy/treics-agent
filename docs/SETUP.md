@@ -130,6 +130,16 @@ git pull --ff-only
 bash scripts/install-guest.sh --skip-apt
 ```
 
+From **treicserver**, the equivalent update is:
+
+```bash
+cd ~/treics-agent
+git pull --ff-only
+bash scripts/ssh-vm.sh 'systemctl --user stop treics-agent && cd ~/treics-agent && git pull --ff-only && bash scripts/install-guest.sh --skip-apt && systemctl --user restart treics-agent'
+```
+
+The installer refreshes Python dependencies (including python-xlib for the live last-click marker) and preserves the existing configuration. No desktop rebuild or model download is needed for the zoom/marker update. Refresh the dashboard after restarting. The full-desktop preview shows the last click in red even while the model examines a zoomed crop; a caption reports that crop's location and dimensions. If the live marker cannot connect to X11, the preview still marks clicks and the dashboard reports the live-marker error.
+
 For an immediate halt of **all** guest activity, power off the VM from the host. A normal shutdown is preferable when it is responsive:
 
 ```bash

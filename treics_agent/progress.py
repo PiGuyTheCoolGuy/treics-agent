@@ -31,6 +31,8 @@ class ProgressGuard:
             return False
         if (before["width"], before["height"]) != (after["width"], after["height"]):
             return False
+        if before.get("source") != after.get("source"):
+            return False
         if before["base64"] == after["base64"]:
             return True
         from PIL import Image

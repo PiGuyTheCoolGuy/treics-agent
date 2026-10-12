@@ -14,6 +14,7 @@ from .checklist import CHECKLIST_PROMPT, ITEM_SCHEMA, UPDATES_SCHEMA
 
 TOOLS = {
     "screenshot": "{}: capture a fresh screen before choosing coordinates.",
+    "zoom_screenshot": '{"x":int,"y":int,"width":int,"height":int,"scale":int optional}: inspect a rectangle of the CURRENT screenshot at higher detail. x/y are its top-left pixel; width/height must fit inside it. Native pixels are enlarged by scale (default 3, range 2–6), capped at the normal image budget. The next image uses LOCAL crop coordinates.',
     "click": '{"x":int,"y":int,"button":"left|right|middle","clicks":1|2}',
     "move": '{"x":int,"y":int}: move the pointer.',
     "drag": '{"x":int,"y":int,"end_x":int,"end_y":int,"duration":number}: drag from start to end.',
@@ -44,6 +45,9 @@ POINT = {"x": COORDINATE, "y": COORDINATE}
 PATH = {"type": "string", "maxLength": 4096}
 ARGUMENT_SCHEMAS = {
     "screenshot": arguments_schema({}),
+    "zoom_screenshot": arguments_schema({**POINT, "width": {"type": "integer", "minimum": 1},
+                                         "height": {"type": "integer", "minimum": 1}},
+                                        {"scale": {"type": "integer", "minimum": 2, "maximum": 6}}),
     "click": arguments_schema(POINT, {"button": {"enum": ["left", "right", "middle"]},
                                       "clicks": {"type": "integer", "minimum": 1, "maximum": 2}}),
     "move": arguments_schema(POINT),
@@ -84,6 +88,9 @@ def decision_schema(screen: dict | None = None, task_checklist: bool = False,
             for key in ("x", "end_x", "y", "end_y"):
                 if key in properties:
                     properties[key]["maximum"] = screen["width" if key.endswith("x") else "height"] - 1
+            if action == "zoom_screenshot":
+                for key in ("width", "height"):
+                    properties[key]["maximum"] = screen[key]
         cases.append({"type": "object", "additionalProperties": False,
                       "properties": {"action": {"enum": [action]},
                                      "arguments": {**arguments, "properties": properties},
@@ -115,6 +122,13 @@ For browser navigation prefer open_browser. For type, omit paste_keys to use Ctr
 never send an empty paste_keys array. Tool errors identify the action that actually failed.
 For GUI work, inspect screenshots and use screenshot pixel coordinates (origin at top left).
 The controller maps screenshot coordinates to the actual desktop. Do not rescale them yourself.
+For small or uncertain targets, call zoom_screenshot with a rectangle in the current image.
+The resulting screen.view="zoom" image starts at local (0,0). Use pixel coordinates in THAT
+image for click/move/drag/scroll; never add screen.source offsets or divide by zoom yourself.
+Nested zooms also use the latest image's local coordinates. screenshot restores the full view.
+After any ordinary GUI action the next image is full desktop again; use its new coordinates.
+Prefer hotkey ["alt","F4"] to close the active window, and other reliable keyboard shortcuts.
+The human desktop preview marks the last executed click. That marker is excluded from your image.
 Coordinates are separate integer x and y fields, never an array. Use literal image pixels,
 not a normalized 0-1000 scale. x must be less than screen.width; y less than screen.height.
 The image attached to the current user message is available now: inspect it directly.

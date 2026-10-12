@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import io
 import json
+import subprocess
 import tempfile
 import threading
 import time
@@ -27,20 +28,24 @@ class FakeDesktop(Desktop):
         self.captures = 0
         self.commands = []
         self.color = "#122037"
+        self.marker = mock.Mock()
+        self.marker.hidden.return_value = mock.MagicMock()
+        self.pointer = (0, 0)
 
-    def capture(self):
+    def capture(self, region=None):
         self.captures += 1
-        image = Image.new("RGB", (1024, 768), self.color)
-        output = io.BytesIO()
-        image.save(output, format="JPEG")
-        self.image = output.getvalue()
-        self.frame = {"width": 1024, "height": 768, "desktop_width": 1920,
-                      "desktop_height": 1440, "captured_at": time.time(),
-                      "base64": base64.b64encode(self.image).decode()}
-        return self.frame.copy()
+        return super().capture(region)
 
     def command(self, args, **kwargs):
         self.commands.append(args)
+        output = b""
+        if args[0] == "scrot":
+            Image.new("RGB", (1920, 1440), self.color).save(args[-1])
+        elif args[:2] == ["xdotool", "mousemove"]:
+            self.pointer = tuple(map(int, args[-2:]))
+        elif args[:2] == ["xdotool", "getmouselocation"]:
+            output = f"X={self.pointer[0]}\nY={self.pointer[1]}\nSCREEN=0\nWINDOW=0\n".encode()
+        return subprocess.CompletedProcess(args, 0, stdout=output)
 
 
 def decision(action, arguments, state="Working state"):

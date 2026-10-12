@@ -7,6 +7,8 @@ The default model is **`qwen3-vl:30b-a3b-instruct`**, the quantized vision model
 ## What it can do
 
 - See the desktop, click, double-click, right-click, drag, scroll, paste Unicode text, and use keyboard shortcuts.
+- Inspect small targets with `zoom_screenshot`; clicks in the crop map back to the desktop automatically.
+- See a red last-click crosshair on the live desktop/VNC and dashboard preview, with coordinates in the log.
 - Open Firefox, run Bash commands, read/write files, install guest software with `sudo`, and verify its work.
 - Keep a working summary within a run and persistent notes between runs.
 - Save run history and tool results in SQLite, with the most recent screenshot saved per run.
@@ -68,13 +70,17 @@ The desktop starts automatically even though nobody is logged into a physical di
 
 Only the latest screenshot is sent to the model. Terminal/file steps use text results and omit old images. The agent can request a new screenshot when it returns to GUI work. Actual latency needs to be measured on your server; this repository contains no R620 benchmark results. An 8B model is also supported if you want to compare it later.
 
+For a small target, the model can request `zoom_screenshot` with `x`, `y`, `width`, and `height` in the **current image's pixels**. A fresh native-resolution crop is enlarged (default 3×, optional `scale` 2–6) within the same screenshot size limit. Click, move, drag, and scroll then use local crop coordinates. The controller applies the crop offset and scaling; the next ordinary desktop action restores the full view. Zooming makes existing pixels easier to inspect; it cannot recover detail absent from the native desktop.
+
+The last successful `click` leaves a hollow red crosshair on the actual desktop and the dashboard's full-desktop preview. It passes mouse input through and never takes keyboard focus. The marker stays until the next click or controller restart; pointer movement and scrolling do not move it. Model images exclude the marker. Each click result records the source image coordinates, mapped desktop coordinates, and pointer coordinates sampled immediately before sending the click. The dashboard also reports when the model is inspecting a crop. To close the active window, the model is instructed to prefer `Alt+F4`.
+
 ## Verification
 
 ```bash
-# Python 3.11+ with Pillow installed; no model needed for these regression tests.
+# Python 3.11+ with project dependencies installed; no model needed for these regression tests.
 python3 -m unittest discover -s tests -v
 ```
 
-The regression suite exercises real shell/file operations, cancellation, pause/resume, persistence, HTTP authentication, the Ollama request format and image handling, the gateway's model/API limits, and disconnect cancellation using a local simulated Ollama endpoint. It does not test Qwen's task accuracy or boot a KVM guest. Run `doctor --test-model` and the example task after provisioning to verify the real desktop/model integration.
+The regression suite exercises real shell/file operations, cancellation, pause/resume, persistence, HTTP authentication, zoom and nested-crop coordinate mapping, click-marker separation from model images, the Ollama request format and image handling, the gateway's model/API limits, and disconnect cancellation using a local simulated Ollama endpoint. An optional Xvfb test checks real marker visibility, input passthrough, focus, and clean captures when X11 tools are installed. It does not test Qwen's task accuracy or boot a KVM guest. Run `doctor --test-model` and the example task after provisioning to verify the real desktop/model integration.
 
 More detail: [setup and troubleshooting](docs/SETUP.md) · [architecture and operation](docs/ARCHITECTURE.md).

@@ -97,6 +97,8 @@ Then click **Refresh models**, choose `qwen3-vl:8b`, and click **Use model**. Bo
 
 The `TREICS_AGENT_MODEL` environment variable overrides the configuration. Remove that override and restart the controller before selecting a different model in the dashboard. The selector uses short metadata requests through the existing authenticated gateway; discovery remains available during inference without interfering with Stop or the live desktop feed. The first task with a newly selected model may include its normal load time.
 
+Agent actions and the vision smoke test explicitly send `think: false` so models that support disabling reasoning can spend their output budget on the requested JSON. This does not disable image input. If a task still reaches its output limit, the controller rejects the truncated action and reports the configured `num_predict`. Keep reason/state and file-writing actions smaller, or raise `num_predict` in the guest config and restart. The default is 1,600; the current gateway accepts up to 4,096. Longer responses can take more time. Models that cannot disable thinking may still spend tokens on reasoning.
+
 The gateway limits context to 16,384 tokens, output to 4,096 tokens, threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
 
 ### Optional task checklist experiment

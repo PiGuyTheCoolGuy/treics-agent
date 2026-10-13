@@ -65,7 +65,7 @@ def doctor(cfg: Config, test_model: bool = False) -> int:
             Image.new("RGB", (128, 128), "red").save(output, format="PNG")
             start = time.monotonic()
             reply = client.request("POST", "/api/chat", {
-                "model": cfg.model, "stream": False, "keep_alive": cfg.keep_alive,
+                "model": cfg.model, "stream": False, "think": False, "keep_alive": cfg.keep_alive,
                 "format": {"type": "object", "properties": {"color": {"type": "string"}}, "required": ["color"]},
                 "messages": [{"role": "user", "content": "Return the image color as JSON, e.g. {\"color\":\"red\"}.",
                               "images": [base64.b64encode(output.getvalue()).decode()]}],

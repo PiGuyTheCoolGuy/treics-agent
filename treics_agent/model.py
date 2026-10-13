@@ -141,6 +141,8 @@ Do not repeatedly request screenshots when a current image is already attached.
 Only the newest image is current. After terminal/file/memory actions there is no current image;
 request screenshot if you need one. Never guess coordinates without a current screenshot.
 Perform one action per response. Verify the result of meaningful changes before claiming success.
+Keep reason and state brief. Split large file generation across smaller shell actions instead
+of returning a whole large file in one write_file response. Every response has an output budget.
 step_budget gives the current step, maximum steps, and steps_remaining INCLUDING this step.
 The maximum is a ceiling, not a target. Finish as soon as the task is complete or blocked.
 Reserve steps for saving and verifying the deliverable and a finish action. With few steps left,
@@ -416,13 +418,15 @@ class ModelClient:
                  '"reason":"short description", "state":"observed progress and next step"}'}, user],
             "format": decision_schema(screen, self.config.task_checklist,
                                       self.config.task_checklist and not checklist), "stream": False,
+            "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
                         "num_thread": self.config.num_thread, "num_predict": self.config.num_predict},
         }
         result = self.request("POST", "/api/chat", payload, stop)
         if result.get("done_reason") == "length":
-            raise ModelError("Model exceeded the response token limit; use a shorter action.")
+            raise ModelError(f"Model reached num_predict={self.config.num_predict} before completing its response. "
+                             "No action was executed. Use a shorter reason/state and smaller file-writing steps.")
         try:
             decision = parse_decision(result["message"]["content"], self.config.task_checklist)
         except (KeyError, TypeError) as exc:

@@ -80,7 +80,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         if self.path == "/api/show":
             return self.reply({"capabilities": self.server.capabilities.get(payload["model"], ["completion", "vision"])})
         self.reply({"message": {"role": "assistant", "content": json.dumps(self.server.decision)},
-                    "done": True, "total_duration": 1000000000, "eval_count": 20})
+                    "done": True, "total_duration": 1000000000, "eval_count": 20, **self.server.reply_overrides})
 
 
 class HTTPTests(unittest.TestCase):
@@ -96,6 +96,7 @@ class HTTPTests(unittest.TestCase):
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         self.upstream.daemon_threads = True
         self.upstream.payloads = []
+        self.upstream.reply_overrides = {}
         self.upstream.block = False
         self.upstream.block_paths = None
         self.upstream.capabilities = {}
@@ -479,6 +480,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(metrics["eval_count"], 20)
         payload = self.upstream.payloads[-1]
         self.assertEqual(len(payload["messages"]), 2)
+        self.assertIs(payload["think"], False)
         self.assertEqual(len(payload["messages"][1]["images"]), 1)
         self.assertEqual(json.loads(payload["messages"][1]["content"])["step_budget"], budget)
         self.assertEqual(json.loads(payload["messages"][1]["content"])["filesystem"], filesystem)
@@ -498,6 +500,25 @@ class HTTPTests(unittest.TestCase):
         self.upstream.decision = decision("type", {"text": "https://example.com", "paste_keys": []})
         with self.assertRaisesRegex(ModelError, "type.arguments.paste_keys"):
             ModelClient(cfg).decide("Type", "", "", [], self.desktop.capture(), threading.Event())
+
+    def test_small_vision_model_disables_thinking_and_rejects_token_limited_actions(self):
+        self.configure_models()
+        cfg = dataclasses.replace(self.cfg, model="qwen3-vl:8b")
+        client = ModelClient(cfg)
+        result, _ = client.decide("Inspect the screenshot", "", "", [], self.desktop.capture(), threading.Event())
+        self.assertEqual(result["action"], "finish")
+        payload = self.upstream.payloads[-1]
+        self.assertIs(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], cfg.num_predict)
+        self.assertEqual(len(payload["messages"][1]["images"]), 1)
+        self.assertTrue(self.proxy.inference.acquire(timeout=2))
+        self.proxy.inference.release()
+        # Even valid-looking JSON must not be dispatched after Ollama reports truncation.
+        self.upstream.decision = decision("write_file", {"path": "must-not-run.txt", "content": "partial output"})
+        self.upstream.reply_overrides = {"done_reason": "length"}
+        with self.assertRaisesRegex(ModelError, "num_predict=1600.*No action was executed"):
+            client.decide("Write the file", "", "", [], None, threading.Event())
+        self.assertFalse((cfg.work_path / "must-not-run.txt").exists())
 
     def test_checklist_mode_adds_plan_schema_and_evidence_context_only_when_enabled(self):
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,

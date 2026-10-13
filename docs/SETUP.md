@@ -246,6 +246,7 @@ This controller can access everything that guest user can access. Install it in 
 | Gateway HTTP 403 | Model tag must match the allowlist exactly; model-management endpoints are intentionally unavailable. |
 | Gateway HTTP 429 | A previous model request is still draining; wait briefly. Only one inference is admitted. |
 | No screenshot / X11 error | In guest: `systemctl --user status treic-desktop`, `DISPLAY=:99 XAUTHORITY=~/.Xauthority xdpyinfo`. |
+| Shortcut fails because of capitalization | Update the controller. Keyboard tools normalize function/common key names (`f4` → `F4`) and log `keys_sent`. Unknown names produce an error before input; check focus and the next screenshot if a valid shortcut has no effect. |
 | Repeated actions/errors | Inspect the activity log's result and `recovery_context`: short failed commands, cwd, error/status, and repeat counts remain visible to the model beyond recent history. Fresh path metadata may show a changed precondition. Use Pause/Stop in manual mode, or choose a repeat count in Stall controls. |
 | Model emits truncated JSON | Keep actions smaller; raise `num_predict` up to gateway limit 4096 if required. |
 | Dashboard is unreachable | Keep the laptop SSH tunnel open; check guest `systemctl --user status treics-agent`. |

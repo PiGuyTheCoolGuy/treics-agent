@@ -26,7 +26,7 @@ from treics_agent.tools import Desktop, Tools
                      "Real X11 desktop tools are not installed")
 class X11Tests(unittest.TestCase):
     def test_live_marker_click_through_focus_clean_capture_and_cleanup(self):
-        from Xlib import X, display
+        from Xlib import X, XK, display
         from Xlib.ext import shape
 
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +69,8 @@ class X11Tests(unittest.TestCase):
                 window = screen.root.create_window(0, 0, 800, 600, 0, screen.root_depth,
                                                    X.InputOutput, X.CopyFromParent,
                                                    background_pixel=pixel,
-                                                   event_mask=X.ButtonPressMask | X.ButtonReleaseMask)
+                                                   event_mask=X.ButtonPressMask | X.ButtonReleaseMask |
+                                                              X.KeyPressMask | X.KeyReleaseMask)
                 window.map()
                 window.set_input_focus(X.RevertToParent, X.CurrentTime)
                 client.sync()
@@ -102,6 +103,18 @@ class X11Tests(unittest.TestCase):
                 after = desktop.capture()
                 self.assertEqual(before["base64"], after["base64"])
                 self.assertTrue(desktop.marker.visible)  # Restored after clean capture.
+                # Verify real input events, rather than only the xdotool command string.
+                for keys in (["alt", "f4"], ["Alt", "F4"], ["ALT", "f4"]):
+                    result = tools.execute("hotkey", {"keys": keys}, threading.Event())
+                    self.assertEqual(result["keys_sent"], "alt+F4")
+                    client.sync()
+                    f4_presses = []
+                    while client.pending_events():
+                        event = client.next_event()
+                        if event.type == X.KeyPress and client.keycode_to_keysym(event.detail, 0) == XK.XK_F4:
+                            f4_presses.append(event)
+                    self.assertEqual(len(f4_presses), 1, f"F4 was not delivered for {keys}")
+                    self.assertTrue(f4_presses[0].state & X.Mod1Mask, f"Alt was not held for {keys}")
                 with desktop.marker.hidden():
                     clean = root / "clean.png"
                     desktop.command(["scrot", "-o", str(clean)])

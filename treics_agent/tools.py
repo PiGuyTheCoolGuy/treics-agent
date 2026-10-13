@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import ctypes.util
 import io
 import json
 import math
@@ -13,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -37,6 +40,18 @@ def text(value, name: str, maximum: int = 100000) -> str:
     if not isinstance(value, str) or len(value) > maximum or "\0" in value:
         raise ToolError(f"{name} must be text of at most {maximum} characters without NUL bytes.")
     return value
+
+
+@lru_cache(maxsize=1)
+def x11_keysyms():
+    """Use the same keysym lookup as xdotool, without connecting to DISPLAY."""
+    try:
+        library = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        library.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        library.XStringToKeysym.restype = ctypes.c_ulong
+        return library
+    except (OSError, AttributeError) as exc:
+        raise ToolError("Cannot validate keyboard keys: libX11 is unavailable. Run scripts/install-guest.sh.") from exc
 
 
 class Desktop:
@@ -201,15 +216,41 @@ class Desktop:
     def key_combination(keys: list[str]) -> str:
         if not isinstance(keys, list) or not 1 <= len(keys) <= 6:
             raise ToolError("keys must be a list of 1–6 X11 key names.")
-        if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_]+", k) for k in keys):
+        if any(not isinstance(k, str) or len(k) > 64 or not re.fullmatch(r"[A-Za-z0-9_]+", k) for k in keys):
             raise ToolError("Invalid X11 key name.")
-        aliases = {"enter": "Return", "esc": "Escape", "escape": "Escape", "backspace": "BackSpace",
-                   "space": "space", "tab": "Tab", "delete": "Delete", "control": "ctrl",
-                   "super": "super", "shift": "shift", "alt": "alt"}
-        return "+".join(aliases.get(k.lower(), k) for k in keys)
+        named = ("Return", "Tab", "ISO_Left_Tab", "Escape", "BackSpace", "space", "Delete", "Insert",
+                 "Home", "End", "Left", "Right", "Up", "Down", "Prior", "Next", "Page_Up", "Page_Down",
+                 "Print", "Pause", "Menu", "Caps_Lock", "Num_Lock", "Scroll_Lock",
+                 "Control_L", "Control_R", "Alt_L", "Alt_R", "Shift_L", "Shift_R",
+                 "Super_L", "Super_R", "Meta_L", "Meta_R", "KP_Enter", "KP_Tab",
+                 "KP_Home", "KP_End", "KP_Left", "KP_Right", "KP_Up", "KP_Down",
+                 "KP_Prior", "KP_Next", "KP_Page_Up", "KP_Page_Down", "KP_Insert", "KP_Delete")
+        aliases = {name.lower(): name for name in named}
+        aliases.update({f"f{number}": f"F{number}" for number in range(1, 36)})
+        modifiers = {"ctrl": "Control_L", "alt": "Alt_L", "shift": "Shift_L",
+                     "super": "Super_L", "meta": "Meta_L"}
+        aliases.update({name: name for name in modifiers})
+        aliases.update({"enter": "Return", "esc": "Escape", "control": "ctrl",
+                        "pageup": "Page_Up", "pgup": "Page_Up", "pagedown": "Page_Down", "pgdn": "Page_Down"})
+        normalized = [aliases.get(key.lower(), key) for key in keys]
+        library = x11_keysyms()
+        for original, key in zip(keys, normalized):
+            symbol = library.XStringToKeysym(modifiers.get(key, key).encode("ascii"))
+            # xdotool also accepts explicit decimal X11 keycodes.
+            if not symbol and not (key.isdecimal() and 8 <= int(key) <= 255):
+                raise ToolError(f"Unknown X11 key name {original!r}; no shortcut was sent. "
+                                "Use keys such as F4, Return, Escape, Left, or ctrl.")
+        # Letter case is intentional: 'a' and 'A' can send different modifiers.
+        return "+".join(normalized)
 
-    def key(self, keys: list[str]) -> None:
-        self.command(["xdotool", "key", "--clearmodifiers", self.key_combination(keys)])
+    def key(self, keys: list[str]) -> str:
+        combination = self.key_combination(keys)
+        completed = self.command(["xdotool", "key", "--clearmodifiers", combination])
+        warning = (completed.stderr or b"").decode(errors="replace").strip()
+        if "no such key name" in warning.lower() or "failure converting key sequence" in warning.lower():
+            raise ToolError(f"xdotool rejected shortcut {combination!r}: {warning[:500]}. "
+                            "Part of the shortcut may have been sent; inspect the desktop before retrying.")
+        return combination
 
 
 class Tools:
@@ -518,11 +559,11 @@ class Tools:
                 subprocess.run(["xclip", "-selection", "clipboard"], input=content.encode(),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                env=self.config.desktop_env(), check=True, timeout=10)
-                d.key(keys)
+                result["keys_sent"] = d.key(keys)
             elif action == "press":
-                d.key([a["key"]])
+                result["keys_sent"] = d.key([a["key"]])
             elif action == "hotkey":
-                d.key(a["keys"])
+                result["keys_sent"] = d.key(a["keys"])
             elif action == "open_browser":
                 url = text(a["url"], "url", 4096)
                 parsed = urlsplit(url)

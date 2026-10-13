@@ -121,6 +121,8 @@ A result with skipped=true means the requested directory/content already exists.
 progress. Do not repeat it; continue to the next task step, verify the result, or finish with a blocker.
 For browser navigation prefer open_browser. For type, omit paste_keys to use Ctrl+V;
 never send an empty paste_keys array. Tool errors identify the action that actually failed.
+Function keys and common named keys are normalized regardless of capitalization: f4 sends F4.
+Ordinary letter case remains significant. keys_sent reports the normalized shortcut, not its UI effect.
 For GUI work, inspect screenshots and use screenshot pixel coordinates (origin at top left).
 The controller maps screenshot coordinates to the actual desktop. Do not rescale them yourself.
 For small or uncertain targets, call zoom_screenshot with a rectangle in the current image.

@@ -83,6 +83,8 @@ For a small target, the model can request `zoom_screenshot` with `x`, `y`, `widt
 
 The last successful `click` leaves a hollow red crosshair on the actual desktop and the dashboard's full-desktop preview. It passes mouse input through and never takes keyboard focus. The marker stays until the next click or controller restart; pointer movement and scrolling do not move it. Model images exclude the marker. Each click result records the source image coordinates, mapped desktop coordinates, and pointer coordinates sampled immediately before sending the click. The dashboard also reports when the model is inspecting a crop. To close the active window, the model is instructed to prefer `Alt+F4`. For mouse-only closing, it is instructed to dismiss obscuring menus with Escape and locate the X on the window's actual title bar, rather than XFCE's top-panel account menu.
 
+Keyboard tools normalize function keys and common named keys: `alt` + `f4`, `Alt` + `F4`, and `ALT` + `f4` all send `alt+F4`. This also applies to `press` and clipboard paste shortcuts. Ordinary letter case is preserved. Unknown key names are rejected before sending any part of the shortcut or changing the clipboard, and `keys_sent` in the result records the normalized shortcut. Sending valid keys still requires checking the next screenshot to confirm the window actually closed.
+
 The dashboard starts a live desktop stream when you connect. It keeps showing desktop changes during long model calls, terminal work, pause, and idle time. **Pause live view** freezes the feed while the task keeps running; **Resume live view** reconnects. A hidden browser tab suspends its stream until visible again. Automatic reconnection handles a dropped connection. The stream uses the same dashboard token, port, and SSH tunnel, and shows the full desktop even while the model inspects a zoomed crop.
 
 One separate capture worker serves all viewers (up to four) and stops when the last viewer disconnects. Only the latest JPEG is retained in memory; live frames are not added to the model context or saved as a recording. Set `stream_fps = 5` (1–15) and `stream_quality = 70` (30–95) in the guest config to adjust smoothness/bandwidth, then restart the controller. The worker uses Pillow's native X11 capture and includes the hardware pointer through XFIXES when available. No extra viewer port or video service is required.
@@ -92,7 +94,7 @@ Dashboard status and cached screenshot reads remain available while desktop acti
 ## Verification
 
 ```bash
-# Python 3.11+ with project dependencies installed; no model needed for these regression tests.
+# Python 3.11+ with project dependencies and libX11 installed; no model needed for these regression tests.
 python3 -m unittest discover -s tests -v
 ```
 

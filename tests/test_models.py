@@ -7,11 +7,27 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from treics_agent.config import Config, initialize_config, load_config, set_model
+from treics_agent.config import Config, initialize_config, load_config, set_model, set_stall_attempts
 from treics_agent.model import ModelClient, ModelError
 
 
 class ModelConfigTests(unittest.TestCase):
+    def test_manual_stall_default_and_saved_repeat_count_preserve_model_and_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            initialize_config(path)
+            initial = load_config(path)
+            self.assertEqual(initial.stall_attempts, 0)
+            path.write_text(path.read_text().replace("stall_attempts = 0\n", ""))
+            self.assertEqual(load_config(path).stall_attempts, 0, "Old configs did not default to manual control")
+            set_stall_attempts(25, path)
+            self.assertEqual(load_config(path), dataclasses.replace(initial, stall_attempts=25))
+            path.write_text(path.read_text().replace("stall_attempts = 25", "'stall_attempts' = 25 # chosen count"))
+            set_model("qwen3-vl:8b", path)
+            set_stall_attempts(0, path)
+            self.assertEqual(load_config(path), dataclasses.replace(initial, model="qwen3-vl:8b"))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_model_selection_survives_reload_and_preserves_credentials_comments_and_permissions(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "custom.toml"

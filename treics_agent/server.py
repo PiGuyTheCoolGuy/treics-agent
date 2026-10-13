@@ -118,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send(200, files("treics_agent").joinpath("static/index.html").read_bytes(), "text/html; charset=utf-8")
             return
-        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js"):
+        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js", "/assets/stall-controls.js"):
             self.send(200, files("treics_agent").joinpath("static", path.rsplit("/", 1)[1]).read_bytes(),
                       "application/javascript; charset=utf-8")
             return
@@ -172,6 +172,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(201, {"run_id": run_id})
             elif path == "/api/model":
                 self.send(200, agent.switch_model(payload.get("model")))
+            elif path == "/api/stall":
+                self.send(200, agent.set_stall_control(payload.get("stall_attempts")))
             elif path in ("/api/pause", "/api/resume", "/api/stop"):
                 getattr(agent, path.rsplit("/", 1)[1])()
                 self.send(200, {"ok": True})

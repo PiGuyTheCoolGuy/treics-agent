@@ -18,6 +18,11 @@ def validate_model_name(model: str) -> None:
         raise ValueError("model must be a model name of 1–256 characters without whitespace")
 
 
+def validate_stall_attempts(attempts: int) -> None:
+    if type(attempts) is not int or not 0 <= attempts <= 1000:
+        raise ValueError("stall_attempts must be an integer from 0 to 1000; 0 means manual control")
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     ollama_url: str = "http://192.168.152.1:11435"
@@ -40,6 +45,7 @@ class Config:
     max_run_minutes: int = 240
     shell_timeout: int = 120
     history_steps: int = 6
+    stall_attempts: int = 0
     task_checklist: bool = False
     browser: str = "firefox"
     bind: str = "127.0.0.1"
@@ -54,6 +60,7 @@ class Config:
             "stream_fps": (1, 15), "stream_quality": (30, 95),
             "max_steps": (1, 10000), "max_run_minutes": (1, 1440),
             "shell_timeout": (1, 600), "history_steps": (1, 20), "port": (1024, 65535),
+            "stall_attempts": (0, 1000),
         }
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
@@ -124,20 +131,30 @@ def set_model(model: str, path: Path | None = None) -> Path:
     validate_model_name(model)
     if "TREICS_AGENT_MODEL" in os.environ and os.environ["TREICS_AGENT_MODEL"] != model:
         raise ValueError("TREICS_AGENT_MODEL fixes the model. Remove that environment override and restart before switching.")
+    return _set_setting("model", model, path)
+
+
+def set_stall_attempts(attempts: int, path: Path | None = None) -> Path:
+    validate_stall_attempts(attempts)
+    return _set_setting("stall_attempts", attempts, path)
+
+
+def _set_setting(name: str, value: str | int, path: Path | None) -> Path:
     path = (path or config_path()).expanduser()
     if not path.exists():
         raise ValueError("Configuration is missing; run treics-agent init first.")
     source = path.read_text()
     load_config(path)
-    setting = "model = " + json.dumps(model)
-    pattern = r"""^[ \t]*(?:model|"model"|'model')[ \t]*=.*$"""
+    setting = name + " = " + json.dumps(value)
+    escaped = re.escape(name)
+    pattern = rf"""^[ \t]*(?:{escaped}|"{escaped}"|'{escaped}')[ \t]*=.*$"""
     if re.search(pattern, source, re.MULTILINE):
         proposed = re.sub(pattern, lambda _: setting, source, flags=re.MULTILINE)
     else:
         proposed = setting + "\n" + source
     values = tomllib.loads(proposed)
-    if values.get("model") != model:
-        raise ValueError("Could not update the model setting; configuration was not changed.")
+    if values.get(name) != value:
+        raise ValueError(f"Could not update the {name} setting; configuration was not changed.")
     Config(**values).validate()
     # Replace atomically: a failed write cannot truncate credentials or other settings.
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)

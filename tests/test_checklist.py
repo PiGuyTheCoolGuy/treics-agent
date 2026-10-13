@@ -188,6 +188,7 @@ class ChecklistTests(unittest.TestCase):
         self.assertIsNone(self.store.evidence(run["id"], rejected["id"]))
 
     def test_repeated_unchanged_plans_pause_even_when_revision_reason_changes(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         plan = [item("read", "file_read", "report.md")]
         model = self.build([decision("set_checklist", {"items": plan, "revision_reason": reason})
                             for reason in ("Initial plan", "Check again", "Review plan", "Ensure plan exists")] +

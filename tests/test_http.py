@@ -15,6 +15,7 @@ from pathlib import Path
 from treics_agent.agent import Agent
 from treics_agent.config import Config, load_config
 from treics_agent.model import Cancelled, ModelClient, ModelError
+from treics_agent.progress import ProgressGuard
 from treics_agent.server import AgentHTTPServer
 from treics_agent.storage import Store
 from treics_agent.tools import Tools
@@ -654,6 +655,7 @@ class HTTPTests(unittest.TestCase):
         self.assertIn(original, report["source"])
 
     def test_dashboard_exposes_automatic_pause_reason_and_resume_control(self):
+        self.agent.config = dataclasses.replace(self.agent.config, stall_attempts=3)
         self.agent.model = FakeModel([decision("screenshot", {})] * 3 +
                                      [decision("finish", {"summary": "Recovered"})])
         controls = {"X-Treic-Agent": "1"}
@@ -674,6 +676,120 @@ class HTTPTests(unittest.TestCase):
         self.agent.thread.join(3)
         self.assertEqual(self.store.run(run_id)["status"], "completed")
         self.assertIsNone(self.agent.snapshot()["pause_reason"])
+
+    def test_stall_controls_are_authenticated_saved_and_failed_changes_preserve_settings(self):
+        path = self.configure_models()
+        controls = {"X-Treic-Agent": "1"}
+        payload = {"stall_attempts": 7}
+        self.assertEqual(request(self.api, "/assets/stall-controls.js")[0], 200)
+        self.assertEqual(request(self.api, "/api/stall", "POST", payload)[0], 401)
+        self.assertEqual(request(self.api, "/api/stall", "POST", payload, self.cfg.dashboard_token)[0], 403)
+        self.assertEqual(request(self.api, "/api/stall", "POST", payload, self.cfg.dashboard_token,
+                                 {**controls, "Origin": "https://attacker.example"})[0], 403)
+        status, body = request(self.api, "/api/stall", "POST", payload, self.cfg.dashboard_token, controls)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(load_config(path), dataclasses.replace(self.cfg, stall_attempts=7))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        original = path.read_bytes()
+        for invalid in (None, True, -1, 1001, 1.5, "7"):
+            self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": invalid},
+                                     self.cfg.dashboard_token, controls)[0], 400)
+        with mock.patch("treics_agent.config.os.replace", side_effect=OSError("disk error")):
+            self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 0},
+                                     self.cfg.dashboard_token, controls)[0], 400)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.agent.config.stall_attempts, 7)
+        self.assertFalse(self.agent.stall_setting_saving)
+        state = json.loads(request(self.api, "/api/state", token=self.cfg.dashboard_token)[1])
+        self.assertEqual(state["stall_attempts"], 7)
+        self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 0},
+                                 self.cfg.dashboard_token, controls)[0], 200)
+        self.assertEqual(load_config(path).stall_attempts, 0)
+
+    def test_manual_control_can_be_applied_to_an_automatically_paused_task(self):
+        path = self.configure_models()
+        controls = {"X-Treic-Agent": "1"}
+        self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 3},
+                                 self.cfg.dashboard_token, controls)[0], 200)
+        self.agent.model = FakeModel([decision("screenshot", {})] * 10 + [decision("finish", {"summary": "Done"})])
+        run_id = self.agent.start("Change stall controls during a task", 30)
+        deadline = time.monotonic() + 3
+        while self.store.run(run_id)["status"] != "paused" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.run(run_id)["status"], "paused")
+        self.assertEqual(self.agent.model.calls, 3)
+        self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 0},
+                                 self.cfg.dashboard_token, controls)[0], 200)
+        self.assertEqual(self.store.run(run_id)["status"], "paused", "Saving resumed a task without Resume")
+        self.assertEqual(load_config(path).stall_attempts, 0)
+        self.assertEqual(request(self.api, "/api/resume", "POST", {}, self.cfg.dashboard_token, controls)[0], 200)
+        self.agent.thread.join(5)
+        self.assertFalse(self.agent.thread.is_alive())
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+        self.assertEqual(self.agent.model.calls, 11)
+        self.assertTrue(any(event["kind"] == "stall_control" for event in self.store.events(run_id)))
+
+    def test_settings_save_keeps_controls_responsive_and_serializes_configuration_changes(self):
+        self.configure_models()
+        entered, release = threading.Event(), threading.Event()
+        from treics_agent.config import set_stall_attempts
+        def blocked_save(*args):
+            entered.set()
+            release.wait(4)
+            return set_stall_attempts(*args)
+        controls = {"X-Treic-Agent": "1"}
+        result = []
+        with mock.patch("treics_agent.agent.set_stall_attempts", side_effect=blocked_save):
+            worker = threading.Thread(target=lambda: result.append(request(self.api, "/api/stall", "POST",
+                {"stall_attempts": 8}, self.cfg.dashboard_token, controls, timeout=6)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                state = json.loads(request(self.api, "/api/state", token=self.cfg.dashboard_token, timeout=1)[1])
+                self.assertTrue(state["stall_setting_saving"])
+                self.assertEqual(request(self.api, "/api/model", "POST", {"model": "qwen3-vl:8b"},
+                                         self.cfg.dashboard_token, controls, timeout=1)[0], 400)
+                self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 0},
+                                         self.cfg.dashboard_token, controls, timeout=1)[0], 400)
+                self.assertEqual(request(self.api, "/api/stop", "POST", {}, self.cfg.dashboard_token,
+                                         controls, timeout=1)[0], 200)
+            finally:
+                release.set()
+                worker.join(6)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result[0][0], 200)
+        self.assertEqual(self.agent.config.stall_attempts, 8)
+
+    def test_changing_policy_off_and_back_during_observation_prevents_a_stale_pause(self):
+        self.configure_models()
+        controls = {"X-Treic-Agent": "1"}
+        self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 3},
+                                 self.cfg.dashboard_token, controls)[0], 200)
+        self.agent.model = FakeModel([decision("screenshot", {})] * 3 + [decision("finish", {"summary": "Done"})])
+        entered, release = threading.Event(), threading.Event()
+        original = ProgressGuard.same_screen
+        comparisons = []
+        def comparison(before, after):
+            comparisons.append(1)
+            if len(comparisons) == 3:
+                entered.set()
+                release.wait(4)
+            return original(before, after)
+        with mock.patch.object(ProgressGuard, "same_screen", side_effect=comparison):
+            run_id = self.agent.start("Change policy before a pause is published", 20)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 0},
+                                         self.cfg.dashboard_token, controls, timeout=1)[0], 200)
+                self.assertEqual(request(self.api, "/api/stall", "POST", {"stall_attempts": 3},
+                                         self.cfg.dashboard_token, controls, timeout=1)[0], 200)
+            finally:
+                release.set()
+            self.agent.thread.join(3)
+        self.assertFalse(self.agent.thread.is_alive())
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+        self.assertFalse(any(event["kind"] == "stalled" for event in self.store.events(run_id)))
 
     def test_cancel_interrupts_a_response_body_and_releases_proxy_slot(self):
         self.upstream.block = True

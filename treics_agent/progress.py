@@ -6,16 +6,28 @@ import io
 import json
 from collections import deque
 
+from .config import validate_stall_attempts
 from .tools import Tools
 
 
 class ProgressGuard:
     """Pause likely loops using observations, not the model's claimed progress."""
 
-    def __init__(self):
-        self.attempts: deque[str] = deque(maxlen=12)
+    def __init__(self, attempt_limit: int = 3, revision: int | None = None):
+        self.attempt_limit: int | None = None
+        self.revision: int | None = None
+        self.configure(attempt_limit, revision)
+
+    def configure(self, attempt_limit: int, revision: int | None = None) -> None:
+        validate_stall_attempts(attempt_limit)
+        if self.attempt_limit == attempt_limit and self.revision == revision:
+            return
+        self.attempt_limit = attempt_limit
+        self.revision = revision
+        self.window = max(12, attempt_limit * 4)
+        self.attempts: deque[str] = deque(maxlen=self.window)
         self.last_text_result: str | None = None
-        self.recent_errors: deque[str | None] = deque(maxlen=12)
+        self.recent_errors: deque[str | None] = deque(maxlen=self.window)
 
     def reset(self) -> None:
         self.recent_errors.clear()
@@ -48,6 +60,8 @@ class ProgressGuard:
 
     def observe(self, decision: dict, result: dict,
                 before: dict | None, after: dict | None) -> str | None:
+        if not self.attempt_limit:
+            return None
         self.recent_errors.append(None)
         action = decision["action"]
         arguments = decision["arguments"]
@@ -82,20 +96,23 @@ class ProgressGuard:
         else:
             self.reset()
             return None
-        self.attempts.append(signature)
-        count = self.attempts.count(signature)
-        if count >= 3:
+        fingerprint = hashlib.sha256(signature.encode()).hexdigest()
+        self.attempts.append(fingerprint)
+        count = self.attempts.count(fingerprint)
+        if count >= self.attempt_limit:
             return (f"Automatically paused after {count} matching {action} actions: {evidence}. "
                     "Review the desktop and activity log. Resume requests a new decision; "
                     "Stop ends this task.")
         return None
 
     def error(self, decision: dict | None, message: str) -> str | None:
+        if not self.attempt_limit:
+            return None
         action = decision["action"] if decision else "model"
-        signature = action + ": " + message
+        signature = hashlib.sha256((action + ": " + message).encode()).hexdigest()
         self.recent_errors.append(signature)
         count = self.recent_errors.count(signature)
-        if count >= 3:
-            return (f"Automatically paused after {count} repeated {action} errors within twelve attempts: "
+        if count >= self.attempt_limit:
+            return (f"Automatically paused after {count} repeated {action} errors within {self.window} attempts: "
                     f"{message[:500]}. Resume requests a new decision; Stop ends this task.")
         return None

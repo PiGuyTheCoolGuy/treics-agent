@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import Config, config_path, set_model, validate_model_name
+from .config import Config, config_path, set_model, set_stall_attempts, validate_model_name, validate_stall_attempts
 from .checklist import Checklist
 from .model import Cancelled, ModelClient, ModelError
 from .progress import ProgressGuard
@@ -35,6 +35,8 @@ class Agent:
         self.current: str | None = None
         self.previewing = False
         self.model_switching = False
+        self.stall_setting_saving = False
+        self.stall_policy_version = 0
         self.phase = "idle"
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
@@ -55,6 +57,7 @@ class Agent:
                     "model": self.config.model, "ollama_url": self.config.ollama_url,
                     "workspace": str(self.config.work_path), "runs": self.store.runs(),
                     "previewing": self.previewing, "model_switching": self.model_switching,
+                    "stall_attempts": self.config.stall_attempts, "stall_setting_saving": self.stall_setting_saving,
                     "task_active": bool(self.thread and self.thread.is_alive())}
         # Never hold the control lock while consulting desktop state.
         return {**result, **self.tools.desktop.snapshot()}
@@ -72,8 +75,8 @@ class Agent:
         with self.lock:
             if self.thread and self.thread.is_alive():
                 raise ValueError("Finish or stop the current task before switching models.")
-            if self.model_switching:
-                raise ValueError("A model change is already in progress. Try again shortly.")
+            if self.model_switching or self.stall_setting_saving:
+                raise ValueError("A settings change is already in progress. Try again shortly.")
             self.model_switching = True
             config = self.config
         try:
@@ -100,6 +103,29 @@ class Agent:
         finally:
             with self.lock:
                 self.previewing = False
+
+    def set_stall_control(self, attempts: int) -> dict:
+        validate_stall_attempts(attempts)
+        with self.lock:
+            if self.model_switching or self.stall_setting_saving:
+                raise ValueError("A settings change is already in progress. Try again shortly.")
+            self.stall_setting_saving = True
+        try:
+            set_stall_attempts(attempts, self.config_file)
+            with self.lock:
+                if self.config.stall_attempts != attempts:
+                    self.stall_policy_version += 1
+                self.config = dataclasses.replace(self.config, stall_attempts=attempts)
+                if self.thread and self.thread.is_alive():
+                    step = self.store.run(self.current)["step"]
+                    self.store.event(self.current, step, "stall_control", {
+                        "stall_attempts": attempts,
+                        "message": (f"User enabled automatic pause after {attempts} matching attempts."
+                                    if attempts else "User selected manual stall control; Pause/Stop remain available.")})
+            return {"stall_attempts": attempts}
+        finally:
+            with self.lock:
+                self.stall_setting_saving = False
 
     def start(self, task: str, max_steps: int | None = None) -> str:
         if not isinstance(task, str) or not task.strip() or len(task) > 12000:
@@ -192,10 +218,19 @@ class Agent:
                                       "excerpt": encoded[:3500], "context_truncated": True}
         return events
 
-    def _pause_stalled(self, run_id: str, step: int, reason: str, deadline: float) -> None:
+    def _configure_progress(self, progress: ProgressGuard) -> None:
+        with self.lock:
+            attempts, revision = self.config.stall_attempts, self.stall_policy_version
+        progress.configure(attempts, revision)
+
+    def _pause_stalled(self, run_id: str, step: int, reason: str, deadline: float,
+                       attempts: int, revision: int) -> bool:
         with self.condition:
             if self.stop_event.is_set():
                 raise Cancelled()
+            if (not attempts or self.config.stall_attempts != attempts
+                    or self.stall_policy_version != revision):
+                return False  # The user changed the policy while the observation was being checked.
             self.paused = True
             self.pause_reason = reason
             self.store.update(run_id, status="paused", summary=reason)
@@ -203,13 +238,14 @@ class Agent:
             self.set_phase("paused")
             self.condition.notify_all()
         self._gate(deadline)
+        return True
 
     def _run(self, run_id: str) -> None:
         run = self.store.run(run_id)
         deadline = time.monotonic() + self.config.max_run_minutes * 60
         errors = 0
         screen = None
-        progress = ProgressGuard()
+        progress = ProgressGuard(self.config.stall_attempts, self.stall_policy_version)
         checklist = Checklist(self.store, run_id, self.config.work_path) if run["task_checklist"] else None
         try:
             self._gate(deadline)
@@ -276,9 +312,10 @@ class Agent:
                         screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
                         self.tools.desktop.invalidate_frame()
+                    self._configure_progress(progress)
                     reason = progress.observe(decision, result, previous_screen, screen)
-                    if reason and step < run["max_steps"]:
-                        self._pause_stalled(run_id, step, reason, deadline)
+                    if (reason and step < run["max_steps"]
+                            and self._pause_stalled(run_id, step, reason, deadline, progress.attempt_limit, progress.revision)):
                         progress.reset()
                         # The user may have changed the desktop while it was paused.
                         self._gate(deadline)
@@ -303,9 +340,10 @@ class Agent:
                     if isinstance(exc, (ToolError, OSError)):
                         screen = None
                         self.tools.desktop.invalidate_frame()
+                    self._configure_progress(progress)
                     reason = progress.error(decision, message)
-                    if reason and step < run["max_steps"]:
-                        self._pause_stalled(run_id, step, reason, deadline)
+                    if (reason and step < run["max_steps"]
+                            and self._pause_stalled(run_id, step, reason, deadline, progress.attempt_limit, progress.revision)):
                         progress.reset()
                         errors = 0
                         self._gate(deadline)
@@ -314,8 +352,6 @@ class Agent:
                         continue
                     if self.stop_event.wait(min(errors * 2, 10)):
                         raise Cancelled()
-                if errors >= 5:
-                    raise RuntimeError("Stopped after five consecutive model/tool failures; inspect the run log.")
             self.store.update(run_id, status="limit_reached", summary="Step limit reached. Inspect the log and start a follow-up task.")
         except Cancelled:
             self.store.update(run_id, status="stopped", summary="Stopped by user. No further actions will execute.")

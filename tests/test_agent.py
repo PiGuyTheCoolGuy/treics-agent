@@ -76,7 +76,10 @@ class FakeModel:
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
-        return next(self.decisions), {}
+        result = next(self.decisions)
+        if isinstance(result, Exception):
+            raise result
+        return result, {}
 
     def cancel(self):
         self.release.set()
@@ -125,6 +128,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(run["step"], 4)
 
     def test_logged_missing_cwd_then_mkdir_loop_skips_repeats_and_preserves_observed_state(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         target = self.config.work_path / "sales-test"
         setup = {"command": "mkdir -p sales-test", "cwd": str(self.config.work_path)}
         failed = decision("shell", {"command": "mkdir -p sales-test && touch sales.csv",
@@ -192,6 +196,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
     def test_identical_file_write_is_skipped_without_changing_mtime_and_still_pauses_loop(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         args = {"path": "new/nested/script.py", "content": "print('你好')\n"}
         first = self.tools.execute("write_file", args, threading.Event())
         self.assertTrue(first["ok"])
@@ -323,6 +328,7 @@ class AgentTests(unittest.TestCase):
             {"current_step": 2, "max_steps": 100, "steps_remaining": 99}])
 
     def test_stalled_screenshots_pause_and_resume_with_fresh_observation(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         model = self.build([decision("screenshot", {}, "Claimed progress " + str(i)) for i in range(3)] +
                            [decision("write_file", {"path": "after-loop", "content": "ok"}),
                             decision("finish", {"summary": "Recovered"})])
@@ -349,6 +355,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((self.config.work_path / "after-loop").read_text(), "ok")
 
     def test_stop_while_automatically_paused_prevents_next_action(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         model = self.build([decision("screenshot", {})] * 3 +
                            [decision("write_file", {"path": "forbidden", "content": "bad"})])
         run_id = self.agent.start("Stop loop")
@@ -361,6 +368,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse((self.config.work_path / "forbidden").exists())
 
     def test_interleaved_typing_errors_pause_without_recording_failed_state(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         # Reproduce the uploaded log: focus, failed paste, focus, failed paste...
         focus = decision("hotkey", {"keys": ["ctrl", "l"]}, "Address bar focused")
         paste = decision("type", {"text": "https://example.com", "paste_keys": []}, "URL was typed")
@@ -391,10 +399,54 @@ class AgentTests(unittest.TestCase):
             self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], self.desktop.commands)
 
     def test_step_limit_still_ends_run_when_last_action_would_trigger_pause(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=3)
         model = self.build([decision("screenshot", {})] * 3)
         run = self.complete(max_steps=3)
         self.assertEqual(run["status"], "limit_reached")
         self.assertEqual(model.budgets[-1]["steps_remaining"], 1)
+
+    def test_manual_default_allows_repeated_screenshots_until_finish(self):
+        model = self.build([decision("screenshot", {})] * 7 + [decision("finish", {"summary": "Done"})])
+        run = self.complete(max_steps=20)
+        self.assertEqual(self.config.stall_attempts, 0)
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(model.calls, 8)
+        self.assertFalse(any(event["kind"] == "stalled" for event in self.store.events(run["id"])))
+
+    def test_manual_mode_retries_more_than_five_model_failures(self):
+        model = self.build([ModelError("Output limit reached")] * 7 + [decision("finish", {"summary": "Recovered"})])
+        with mock.patch.object(self.agent.stop_event, "wait", side_effect=lambda timeout: self.agent.stop_event.is_set()):
+            run = self.complete(max_steps=20)
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(model.calls, 8)
+        self.assertEqual(len([event for event in self.store.events(run["id"]) if event["kind"] == "error"]), 7)
+
+    def test_custom_error_threshold_can_exceed_old_five_failure_cutoff(self):
+        self.config = dataclasses.replace(self.config, stall_attempts=7)
+        model = self.build([ModelError("Output limit reached")] * 7 + [decision("finish", {"summary": "Recovered"})])
+        with mock.patch.object(self.agent.stop_event, "wait", side_effect=lambda timeout: self.agent.stop_event.is_set()):
+            run_id = self.agent.start("Choose my retry count", 20)
+            self.wait_for_status(run_id, "paused")
+            self.assertEqual(model.calls, 7)
+            self.assertIn("7 repeated model errors", self.agent.snapshot()["pause_reason"])
+            self.agent.resume()
+            self.agent.thread.join(3)
+        self.assertEqual(self.store.run(run_id)["status"], "completed")
+
+    def test_guard_supports_thresholds_over_twelve_and_policy_changes_clear_evidence(self):
+        guard = ProgressGuard(17)
+        cmd = decision("shell", {"command": "printf ready"})
+        for _ in range(16):
+            self.assertIsNone(guard.observe(cmd, {"ok": True, "output": "ready"}, None, None))
+        self.assertIn("17 matching shell", guard.observe(cmd, {"ok": True, "output": "ready"}, None, None))
+        guard.configure(0)
+        with mock.patch.object(guard, "same_screen", side_effect=AssertionError("Manual mode decoded screenshots")):
+            for _ in range(20):
+                self.assertIsNone(guard.observe(decision("screenshot", {}), {"ok": True}, {}, {}))
+                self.assertIsNone(guard.error(None, "Repeated error"))
+        guard.configure(2)
+        self.assertIsNone(guard.error(None, "Repeated error"))
+        self.assertIn("2 repeated model errors", guard.error(None, "Repeated error"))
 
     def test_loop_guard_detects_cycles_but_resets_on_observed_progress(self):
         guard = ProgressGuard()

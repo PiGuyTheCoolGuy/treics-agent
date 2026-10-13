@@ -22,6 +22,9 @@ max_steps = 100
 max_run_minutes = 240
 shell_timeout = 120
 history_steps = 6
+# 0 = manual Pause/Stop. Set 1–1000 to auto-pause after that many matching attempts.
+# The dashboard can save/apply this during a task without restarting.
+stall_attempts = 0
 # Optional progress aid. Verified means its stated tool-result check passed.
 # Use `treics-agent checklist on` / `off`, then restart the controller.
 task_checklist = false

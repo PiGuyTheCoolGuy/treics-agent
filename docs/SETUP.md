@@ -72,6 +72,14 @@ Live viewing starts when you connect, using the same token and SSH tunnel. **Pau
 
 The default is a 5 FPS target at JPEG quality 70. To adjust it, add `stream_fps = 5` (1–15) and `stream_quality = 70` (30–95) to the guest's configuration and restart the controller. Up to four viewers share one on-demand capture worker. More FPS/quality uses more guest CPU and tunnel bandwidth; start with the defaults on the R620. The normal project dependencies provide capture; no additional port, VNC setup, or video service is needed. `doctor` reports whether Pillow's native X11 capture is available.
 
+### Manual and automatic stall control
+
+**Stall controls** default to **Manual Pause/Stop**. The controller keeps retrying repeated actions and errors until you pause/stop it, it finishes, or it reaches your step/time budget. The fixed pauses after three matches and stops after five consecutive failures have been removed. Failed or truncated model actions are still rejected and errors remain visible in the log.
+
+For automatic pausing, choose **Pause automatically**, set the number of **matching attempts** (1–1,000), and click **Apply stall controls**. The count applies to matching unchanged actions and repeated matching errors, rather than all task steps. The separate **Step limit** still controls the overall action budget. Apply can be used during a task, and the choice survives a restart. Disabling automatic pausing leaves an already-paused task paused until you click **Resume**.
+
+The saved guest setting is `stall_attempts = 0` for manual control, or a positive repeat count for automatic pausing. Existing configurations without this field use manual control automatically. No model download or host gateway update is needed.
+
 ## 4. Configure or switch models
 
 In the dashboard's **Model** panel, select an installed model and click **Use model**. The new selection applies immediately to future tasks and is saved in the guest configuration for restarts. Finish or stop the current task first; paused tasks keep their original model. The history shows each run's model so you can compare results. A failed check or save leaves the previous selection active.
@@ -238,7 +246,7 @@ This controller can access everything that guest user can access. Install it in 
 | Gateway HTTP 403 | Model tag must match the allowlist exactly; model-management endpoints are intentionally unavailable. |
 | Gateway HTTP 429 | A previous model request is still draining; wait briefly. Only one inference is admitted. |
 | No screenshot / X11 error | In guest: `systemctl --user status treic-desktop`, `DISPLAY=:99 XAUTHORITY=~/.Xauthority xdpyinfo`. |
-| Task stops after five errors | Inspect the run log for the failing tool/model response; fix the underlying problem before a new task. |
+| Repeated actions/errors | Use Pause/Stop in manual mode, or choose a repeat count in Stall controls. Inspect the activity log for the underlying failure. |
 | Model emits truncated JSON | Keep actions smaller; raise `num_predict` up to gateway limit 4096 if required. |
 | Dashboard is unreachable | Keep the laptop SSH tunnel open; check guest `systemctl --user status treics-agent`. |
 | Another controller is running | Use the existing dashboard. Stop the service before using the standalone `run` command. |

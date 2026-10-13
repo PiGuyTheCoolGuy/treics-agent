@@ -8,6 +8,60 @@ from pathlib import Path
 
 @unittest.skipUnless(shutil.which("node"), "Node is unavailable for dashboard request tests")
 class DashboardTests(unittest.TestCase):
+    def test_stall_controls_keep_manual_default_preserve_drafts_and_apply_custom_counts(self):
+        script = r'''
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const elements=new Map();
+const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='stallMode'?'manual':id==='stallAttempts'?'3':'',textContent:'',disabled:false});return elements.get(id)};
+const context=vm.createContext({document:{getElementById:element}});
+vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+let fail=false,saved=0,finish;
+const calls=[];
+const controls=new context.StallControls(async(path,body)=>{
+  calls.push(JSON.parse(JSON.stringify({path,body})));
+  if(fail)throw new Error('disk error');
+  return new Promise(resolve=>{finish=()=>resolve({stall_attempts:body.stall_attempts})});
+},async()=>{saved++});
+(async()=>{
+  controls.update({stall_attempts:0,task_active:true});
+  assert.equal(element('stallMode').value,'manual');
+  assert.equal(element('stallAttempts').disabled,true);
+  assert.match(element('stallStatus').textContent,/Manual control/);
+  element('stallMode').value='auto';element('stallMode').onchange();
+  element('stallAttempts').value='7';element('stallAttempts').oninput();
+  controls.update({stall_attempts:0,task_active:true});
+  assert.equal(element('stallAttempts').value,'7','Polling erased the chosen repeat count');
+  const pending=controls.save();
+  assert.equal(element('saveStall').disabled,true);
+  finish();await pending;
+  assert.deepEqual(calls[0],{path:'/api/stall',body:{stall_attempts:7}});
+  assert.equal(controls.current,7);
+  assert.equal(saved,1);
+  for(const value of ['','0','1.5','1001']){
+    element('stallAttempts').value=value;element('stallAttempts').oninput();
+    await controls.save();
+    assert.equal(calls.length,1,'An invalid count reached the server');
+  }
+  element('stallMode').value='manual';element('stallMode').onchange();
+  fail=true;await controls.save();
+  assert.equal(controls.current,7,'Failed save changed the active policy');
+  assert.equal(element('saveStall').disabled,false,'Failed save could not be retried');
+  assert.match(element('stallStatus').textContent,/disk error/);
+  fail=false;const manual=controls.save();finish();await manual;
+  assert.equal(controls.current,0);
+  assert.deepEqual(calls.at(-1),{path:'/api/stall',body:{stall_attempts:0}});
+  assert.match(element('stallStatus').textContent,/Resume if the task is already paused/);
+  controls.update({stall_attempts:0,model_switching:true});
+  assert.equal(element('stallMode').disabled,true);
+  controls.update({stall_attempts:20});
+  assert.equal(Number(element('stallAttempts').value),20);
+  assert.match(element('stallStatus').textContent,/Automatic pause after 20/,'External changes left a stale saved message');
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+        path = Path(__file__).resolve().parents[1] / "treics_agent/static/stall-controls.js"
+        result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_model_selection_preserves_drafts_locks_active_tasks_and_saves_changes(self):
         script = r'''
 const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
@@ -167,6 +221,7 @@ const context = vm.createContext({
 });
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[4], 'utf8'), context);
 vm.runInContext(source, context);
 function stall(signal) {
   return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
@@ -199,7 +254,7 @@ function stall(signal) {
 '''
         path = Path(__file__).resolve().parents[1] / "treics_agent/static/index.html"
         result = subprocess.run(["node", "-e", script, str(path), str(path.with_name("desktop-stream.js")),
-                                 str(path.with_name("model-selector.js"))],
+                                 str(path.with_name("model-selector.js")), str(path.with_name("stall-controls.js"))],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

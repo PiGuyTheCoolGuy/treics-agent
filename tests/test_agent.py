@@ -65,14 +65,16 @@ class FakeModel:
         self.states = []
         self.filesystems = []
         self.checklists = []
+        self.recoveries = []
 
-    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None):
+    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None, recovery=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)
         self.states.append(state)
         self.filesystems.append(filesystem)
         self.checklists.append(checklist)
+        self.recoveries.append(recovery)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
@@ -420,6 +422,28 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(run["status"], "completed")
         self.assertEqual(model.calls, 8)
         self.assertEqual(len([event for event in self.store.events(run["id"]) if event["kind"] == "error"]), 7)
+        self.assertEqual(model.recoveries[-1]["failed_attempts"][0]["failure_count"], 7)
+
+    def test_recovery_survives_short_history_and_refreshes_failed_cwd_metadata(self):
+        self.config = dataclasses.replace(self.config, history_steps=1)
+        failing = decision("shell", {"command": "python3 script.py", "cwd": "new-project"})
+        model = self.build([failing, failing,
+            decision("write_file", {"path": "new-project/script.py", "content": "print('fixed')\n"})] +
+            [decision("read_file", {"path": "new-project/script.py"})] * 7 +
+            [failing, decision("finish", {"summary": "Done"})])
+        with mock.patch.object(self.agent.stop_event, "wait", side_effect=lambda timeout: self.agent.stop_event.is_set()):
+            run = self.complete(max_steps=20)
+        self.assertEqual(run["status"], "completed")
+        context = model.recoveries[10]
+        self.assertEqual(context["failed_attempts"][0]["failure_count"], 2)
+        self.assertEqual(context["failed_attempts"][0]["arguments"]["command"], "python3 script.py")
+        self.assertEqual(context["failed_attempts"][0]["observed_change_after_failure_step"], 3)
+        self.assertTrue(all(event["kind"] != "error" for event in model.events[10]))
+        paths = {item["path"]: item["kind"] for item in model.filesystems[10]["paths"]}
+        self.assertEqual(paths[str(self.config.work_path / "new-project")], "directory")
+        self.assertEqual(model.recoveries[-1]["failed_attempts"], [])
+        finished = self.store.events(run["id"])[-1]
+        self.assertIn("recovery_context", finished["data"])
 
     def test_custom_error_threshold_can_exceed_old_five_failure_cutoff(self):
         self.config = dataclasses.replace(self.config, stall_attempts=7)

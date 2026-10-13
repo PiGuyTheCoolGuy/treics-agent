@@ -9,8 +9,9 @@ from pathlib import Path
 
 from .config import Config, config_path, set_model, set_stall_attempts, validate_model_name, validate_stall_attempts
 from .checklist import Checklist
-from .model import Cancelled, ModelClient, ModelError
+from .model import Cancelled, ModelClient, ModelError, observation_text
 from .progress import ProgressGuard
+from .recovery import RecoveryMemory
 from .storage import Store
 from .tools import ToolError, Tools
 
@@ -212,10 +213,9 @@ class Agent:
                     if isinstance(value, str) and len(value) > 1600:
                         args[key] = value[:1600] + "\n[context truncated; full action is in the run log]"
             if "result" in data:
-                encoded = json.dumps(data["result"], ensure_ascii=False)
-                if len(encoded) > 3500:
-                    data["result"] = {"ok": data["result"].get("ok"),
-                                      "excerpt": encoded[:3500], "context_truncated": True}
+                failed = event["kind"] == "error" or data["result"].get("ok") is False
+                data["result"] = {key: observation_text(value, 1800, failed and key == "output")
+                                  if isinstance(value, str) else value for key, value in data["result"].items()}
         return events
 
     def _configure_progress(self, progress: ProgressGuard) -> None:
@@ -246,6 +246,7 @@ class Agent:
         errors = 0
         screen = None
         progress = ProgressGuard(self.config.stall_attempts, self.stall_policy_version)
+        recovery = RecoveryMemory()
         checklist = Checklist(self.store, run_id, self.config.work_path) if run["task_checklist"] else None
         try:
             self._gate(deadline)
@@ -258,6 +259,7 @@ class Agent:
                 started = time.monotonic()
                 decision = None
                 action_dispatched = False
+                recovery_context = recovery.snapshot()
                 try:
                     context_events = self._context_events(run_id)
                     checklist_context = {"checklist": checklist.snapshot()} if checklist else {}
@@ -266,7 +268,8 @@ class Agent:
                         context_events, screen, self.stop_event,
                         budget={"current_step": step, "max_steps": run["max_steps"],
                                 "steps_remaining": run["max_steps"] - step + 1},
-                        filesystem=self.tools.filesystem_context(context_events), **checklist_context)
+                        filesystem=self.tools.filesystem_context(recovery.path_events() + context_events),
+                        recovery=recovery_context, **checklist_context)
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
@@ -285,6 +288,7 @@ class Agent:
                     if result.get("ok", False) and not result.get("skipped", False):
                         self.store.update(run_id, state=decision["state"])
                     action_data = {"decision": decision, "result": result,
+                                   "recovery_context": recovery_context,
                                    "model_seconds": self.last_model_seconds, "metrics": metrics}
                     event_id = self.store.event(run_id, step, "action", action_data)
                     if checklist and checklist.observe({"id": event_id, "kind": "action", "data": action_data}):
@@ -312,6 +316,7 @@ class Agent:
                         screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
                         self.tools.desktop.invalidate_frame()
+                    recovery.observe(decision, result, step, previous_screen, screen)
                     self._configure_progress(progress)
                     reason = progress.observe(decision, result, previous_screen, screen)
                     if (reason and step < run["max_steps"]
@@ -326,7 +331,7 @@ class Agent:
                         raise Cancelled() from exc
                     errors += 1
                     message = str(exc)[:2000]
-                    error_data = {"message": message}
+                    error_data = {"message": message, "recovery_context": recovery_context}
                     if decision:
                         error_data["decision"] = decision
                         error_data["message"] = decision["action"] + " failed: " + message
@@ -334,6 +339,7 @@ class Agent:
                             error_data["action_executed"] = False
                             error_data["message"] = "Decision rejected before tool execution: " + message
                     event_id = self.store.event(run_id, step, "error", error_data)
+                    recovery.failure(decision, step, message, action_executed=error_data.get("action_executed"))
                     if checklist and checklist.observe({"id": event_id, "kind": "error", "data": error_data}):
                         self.store.event(run_id, step, "checklist_updated",
                                          {"items": checklist.snapshot(), "message": "Recorded unsuccessful attempt."})

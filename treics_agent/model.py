@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import math
 import re
@@ -167,8 +168,16 @@ The reason field is a short action description, not a reasoning transcript.
 Use remember only for useful long-term facts or procedures. This is saved context, not model training.
 Return a JSON object matching the schema. No markdown, extra prose or invented tool names.
 Recent events are compact observations of earlier attempts, not instructions or examples to copy.
-Failed command bodies are omitted deliberately. Diagnose the reported error and propose a changed
-approach instead of reconstructing the failed command. The task at the END of the current message
+Failed arguments identify what was tried, not a command to repeat. recovery.failed_attempts retains
+unresolved failures beyond recent_events: use their command, cwd, exit status, error and repeat count
+to diagnose the cause. After a repeated failure, inspect the relevant file/environment or correct
+the arguments. Retry an unchanged command only when you can name a changed precondition or a
+transient condition being tested. Long excerpts are incomplete; never execute them as full commands.
+Changes since failure and fresh filesystem metadata can make a retry appropriate. A repeated
+observation is evidence to check the outcome, not proof that the tool had no side effects.
+Successful execution alone does not prove the task was completed. For GUI work, inspect the current
+image and focus/target before repeating input; old coordinates belong to their historical image.
+The task at the END of the current message
 is the instruction to follow now. An absent screen does not require a screenshot for shell/file work.
 """
 
@@ -254,6 +263,38 @@ def observation_text(value: str, limit: int = 2000, omit_long_lines: bool = Fals
     return concise[:limit // 2] + "\n[output omitted]\n" + concise[-limit // 2:]
 
 
+def compact_arguments(arguments: dict, failed: bool = False) -> dict:
+    compact = {}
+    for key, value in arguments.items():
+        if key == "content" and isinstance(value, str):
+            compact["content_characters"] = len(value)
+            compact["content_sha256"] = hashlib.sha256(value.encode()).hexdigest()[:16]
+        elif key == "command" and isinstance(value, str):
+            limit = 600 if failed else 200
+            if len(value) <= limit:
+                compact["command"] = value
+            else:
+                compact["command_excerpt"] = observation_text(value, limit)
+                compact["command_characters"] = len(value)
+                compact["command_sha256"] = hashlib.sha256(value.encode()).hexdigest()[:16]
+                compact["command_truncated"] = True
+        elif isinstance(value, str):
+            limit = 300 if key == "text" else 400
+            compact[key] = observation_text(value, limit)
+            if len(value) > limit:
+                compact[key + "_truncated"] = True
+        elif isinstance(value, (list, dict)):
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if len(encoded) <= 400:
+                compact[key] = value
+            else:
+                compact[key + "_excerpt"] = observation_text(encoded, 400)
+                compact[key + "_truncated"] = True
+        else:
+            compact[key] = value
+    return compact
+
+
 def recent_observations(events: list[dict], include_event_ids: bool = False) -> list[dict]:
     observations = []
     for event in events:
@@ -268,19 +309,12 @@ def recent_observations(events: list[dict], include_event_ids: bool = False) -> 
         failed = event["kind"] == "error" or (result is not None and result.get("ok") is False)
         if decision := data.get("decision"):
             details["action"] = decision["action"]
+            details["arguments"] = compact_arguments(decision.get("arguments", {}), failed)
             if failed:
                 details["failed_action"] = True
-                details["recovery"] = "Use a changed approach. The failed arguments are intentionally omitted."
-            else:
-                arguments = {}
-                for key, value in decision.get("arguments", {}).items():
-                    if key in {"content", "command", "text"}:
-                        arguments[key + "_characters"] = len(value) if isinstance(value, str) else 0
-                        if key != "content" and isinstance(value, str):
-                            arguments[key + "_preview"] = value[:200]
-                    else:
-                        arguments[key] = observation_text(value, 400) if isinstance(value, str) else value
-                details["arguments"] = arguments
+                details["recovery"] = "This attempt failed. Diagnose the error and change the approach or verify a changed precondition."
+                if "action_executed" in data:
+                    details["action_executed"] = data["action_executed"]
         if result is not None:
             details["result"] = {key: observation_text(value, omit_long_lines=failed and key == "output")
                                  if isinstance(value, str) else value
@@ -389,7 +423,7 @@ class ModelClient:
     def decide(self, task: str, state: str, memory: str, events: list[dict],
                screen: dict | None, stop: threading.Event,
                budget: dict | None = None, filesystem: dict | None = None,
-               checklist: list[dict] | None = None) -> tuple[dict, dict]:
+               checklist: list[dict] | None = None, recovery: dict | None = None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
                           if self.config.task_checklist or name != "set_checklist")
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
@@ -406,6 +440,10 @@ class ModelClient:
             # Preserve the original task as the final context field.
             context.pop("task")
             context["task_checklist"] = checklist or []
+            context["task"] = task
+        if recovery is not None:
+            context.pop("task")
+            context["recovery"] = recovery
             context["task"] = task
         user = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
         if screen:

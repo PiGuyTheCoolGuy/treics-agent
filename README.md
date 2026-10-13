@@ -12,6 +12,7 @@ The default model is **`qwen3-vl:30b-a3b-instruct`**, the quantized vision model
 - Stream the desktop and mouse pointer to the dashboard while the model is thinking, paused, or idle.
 - Open Firefox, run Bash commands, read/write files, install guest software with `sudo`, and verify its work.
 - Keep a working summary within a run and persistent notes between runs.
+- Retain compact failed-command details and repeat counts beyond recent history, with fresh file/directory metadata to help recovery.
 - Save run history and tool results in SQLite, with the most recent screenshot saved per run.
 - Start, pause, resume, and stop a task through an authenticated dashboard on port **8010**.
 
@@ -73,6 +74,8 @@ The desktop starts automatically even though nobody is logged into a physical di
 Only the latest screenshot is sent to the model. Terminal/file steps use text results and omit old images. The agent can request a new screenshot when it returns to GUI work. Actual latency needs to be measured on your server; this repository contains no R620 benchmark results. An 8B model is also supported if you want to compare it later.
 
 The dashboard's **Stall controls** default to **Manual Pause/Stop**. Repeated actions or errors keep retrying within your task's step/time budget. To enable automatic pausing, choose **Pause automatically**, enter 1–1,000 matching attempts, and click **Apply stall controls**. Changes are saved and apply during the current task without a restart. If it is already paused, click **Resume** separately. This replaces the fixed three-attempt pause and five-failure stop rules.
+
+The model receives a small recovery memory with failed commands, working directories, errors, exit statuses, and repeat counts even when those attempts leave recent history. Fresh filesystem metadata and observed changes help it decide whether a retry makes sense. Repeated identical observations prompt it to verify progress. This improves the evidence available to the model; it cannot guarantee that the model chooses the right correction. The recovery context appears in each action's log details and does not pause or stop a run.
 
 Use the dashboard's **Model** panel to switch between installed models allowed by the host gateway. Choose a model and click **Use model** after the current task finishes or stops. The selection is saved in the guest configuration and applies immediately to new tasks, including after a restart. **Refresh models** picks up models you have just installed on the host. The controller checks screenshot support when Ollama reports capabilities, and preserves the current selection if validation or saving fails. Each history entry shows the model that actually ran that task; switching leaves earlier runs intact. See [model setup](docs/SETUP.md#4-configure-or-switch-models) for installing the 8B alternative or allowing another vision model.
 

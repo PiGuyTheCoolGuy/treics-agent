@@ -579,10 +579,32 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn("old report", message["content"])
         first = context["recent_events"][0]["data"]
         self.assertTrue(first["failed_action"])
+        self.assertTrue(first["arguments"]["command_truncated"])
         self.assertIn("SyntaxError: invalid syntax", first["result"]["output"])
         self.assertEqual(context["recent_events"][1]["data"]["arguments"]["path"], "report.md")
         # The full evidence stays intact in the original events / database.
         self.assertEqual(events[0]["data"]["decision"]["arguments"]["command"], failed_code)
+
+    def test_failure_context_keeps_short_commands_tail_errors_and_recovery_before_current_task(self):
+        cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
+                                   ollama_token=self.proxy_token)
+        run_id = self.store.create_run("Recovery context", 20, cfg.model)
+        output = "older output\n" * 2000 + "Traceback:\n" + "broken source" * 1000 + "\nAttributeError: missing_field"
+        self.store.event(run_id, 1, "action", {"decision": decision("shell", {"command": "python3 parser.py", "cwd": "project"}),
+             "result": {"ok": False, "exit_code": 1, "timed_out": False, "output": output}})
+        events = self.agent._context_events(run_id)
+        recovery = {"failed_attempts": [{"action": "shell", "arguments": {"command": "python3 parser.py"},
+                                        "failure_count": 4, "error": "AttributeError: missing_field"}]}
+        ModelClient(cfg).decide("Fix the parser and verify it", "", "", events, None, threading.Event(), recovery=recovery)
+        context = json.loads(self.upstream.payloads[-1]["messages"][1]["content"])
+        failed = context["recent_events"][0]["data"]
+        self.assertEqual(failed["arguments"], {"command": "python3 parser.py", "cwd": "project"})
+        self.assertEqual(failed["result"]["exit_code"], 1)
+        self.assertIn("AttributeError: missing_field", failed["result"]["output"])
+        self.assertNotIn("broken source" * 1000, failed["result"]["output"])
+        self.assertEqual(context["recovery"], recovery)
+        self.assertEqual(list(context)[-1], "task")
+        self.assertEqual(self.store.events(run_id)[0]["data"]["result"]["output"], output)
 
     def test_model_diagnostic_changes_only_history_without_executing_actions_or_recovering_runs(self):
         run_id = self.store.create_run("Failed extraction", 10, self.cfg.model)

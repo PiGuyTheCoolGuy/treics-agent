@@ -380,7 +380,7 @@ class AgentTests(unittest.TestCase):
             run_id = self.agent.start("Reproduce typing loop", 15)
             self.wait_for_status(run_id, "paused")
             self.assertEqual(model.calls, 6)
-            self.assertEqual(self.store.run(run_id)["state"], "Address bar focused")
+            self.assertEqual(self.store.run(run_id)["state"], "")  # Sending focus keys has not verified focus.
             self.assertIn("3 repeated type errors", self.agent.snapshot()["pause_reason"])
             errors = [e for e in self.store.events(run_id) if e["kind"] == "error"]
             self.assertEqual(len(errors), 3)
@@ -423,6 +423,34 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(model.calls, 8)
         self.assertEqual(len([event for event in self.store.events(run["id"]) if event["kind"] == "error"]), 7)
         self.assertEqual(model.recoveries[-1]["failed_attempts"][0]["failure_count"], 7)
+
+    def test_manual_click_loop_reports_repeated_target_and_does_not_save_claimed_gui_success(self):
+        self.config = dataclasses.replace(self.config, history_steps=1)
+        click = decision("click", {"x": 30, "y": 40}, "Falsely claimed window closed")
+        model = self.build([
+            decision("write_file", {"path": "note.txt", "content": "baseline"}, "Note file created"),
+            decision("screenshot", {}, "Observed desktop"), click,
+            decision("screenshot", {}, "Observed unchanged desktop"), click,
+            decision("wait", {"seconds": 0.1}, "Observed unchanged desktop"), click,
+            decision("finish", {"summary": "The intended GUI effect is unverified"}),
+        ])
+        run = self.complete(max_steps=20)
+        self.assertEqual(run["status"], "completed")
+        self.assertNotIn("Falsely claimed window closed", model.states)
+        self.assertEqual(model.states[3], "Observed desktop")
+        self.assertEqual(model.states[5], "Observed unchanged desktop")
+        feedback = model.recoveries[-1]["gui_feedback"]
+        self.assertEqual(feedback["matching_unchanged_attempts"], 3)
+        self.assertFalse(feedback["ui_effect_verified"])
+        self.assertEqual((feedback["desktop_target"]["x"], feedback["desktop_target"]["y"]), (56, 75))
+        events = self.store.events(run["id"])
+        clicks = [event for event in events if event["kind"] == "action" and event["data"]["decision"]["action"] == "click"]
+        self.assertEqual(len(clicks), 3)  # Feedback does not block the user's manual retry policy.
+        for event in clicks:
+            self.assertTrue(event["data"]["result"]["input_sent"])
+            self.assertFalse(event["data"]["result"]["ui_effect_verified"])
+            self.assertFalse(event["data"]["result"]["state_saved"])
+        self.assertFalse(any(event["kind"] == "stalled" for event in events))
 
     def test_recovery_survives_short_history_and_refreshes_failed_cwd_metadata(self):
         self.config = dataclasses.replace(self.config, history_steps=1)

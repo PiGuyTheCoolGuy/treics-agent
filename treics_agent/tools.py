@@ -256,6 +256,7 @@ class Desktop:
 class Tools:
     GUI_ACTIONS = {"screenshot", "zoom_screenshot", "click", "move", "drag", "scroll", "type", "press", "hotkey",
                    "open_browser", "wait"}
+    INPUT_ACTIONS = GUI_ACTIONS - {"screenshot", "zoom_screenshot", "wait"}
     ARGS = {
         "screenshot": (set(), set()),
         "zoom_screenshot": ({"x", "y", "width", "height"}, {"scale"}),
@@ -502,6 +503,9 @@ class Tools:
             return {"ok": True, "summary": text(a["summary"], "summary", 12000)}
         with d.lock:
             result = {"ok": True, "message": f"{action} completed; a full desktop screen will be captured."}
+            if action in self.INPUT_ACTIONS:
+                result.update(input_sent=True, ui_effect_verified=False,
+                              message="Input operation completed. Inspect the next screenshot to verify the intended effect.")
             if action == "zoom_screenshot":
                 region = d.zoom_region(a)
                 return {"ok": True, "capture_region": region,

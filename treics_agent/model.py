@@ -157,6 +157,11 @@ requires missing user input or account access and explain the specific missing i
 The state field is a compact working summary: plan, progress, relevant paths, blockers and next step.
 Record only observed outcomes in state. A proposed click is not evidence a terminal opened;
 a successful hotkey only confirms keys were sent, not that a dialog closed.
+The controller retains the previous working state after GUI input. Update the observed summary
+with an observation/file/finish action after inspecting the new image; never claim an input's
+future effect in state. result.input_sent does not mean the target or intended effect was correct.
+Working state can lag GUI input: the current image and actual tool results take priority.
+Do not spend a step solely to update the summary; continue the task using those observations.
 After a tool error, correct the arguments or choose another approach. If the same action has
 failed to make progress twice, switch approaches; use press Escape for a cancelable dialog,
 or shell tools for research instead of opening a terminal through GUI clicks.
@@ -177,6 +182,12 @@ the arguments. Retry an unchanged command only when you can name a changed preco
 transient condition being tested. Long excerpts are incomplete; never execute them as full commands.
 Changes since failure and fresh filesystem metadata can make a retry appropriate. A repeated
 observation is evidence to check the outcome, not proof that the tool had no side effects.
+recovery.gui_feedback reports the last input, executed desktop target, visual comparison and
+matching unchanged attempts across intervening screenshots/waits. If it reports repeated input
+with no substantial visible change, inspect target/focus, zoom, or change approach within the
+task's requirements. Do not blindly repeat or shift coordinates. Intentional repeated input
+is allowed, but explain why another identical input is needed. A changed image alone does not
+verify the goal either; inspect the visible result.
 Successful execution alone does not prove the task was completed. For GUI work, inspect the current
 image and focus/target before repeating input; old coordinates belong to their historical image.
 The task at the END of the current message

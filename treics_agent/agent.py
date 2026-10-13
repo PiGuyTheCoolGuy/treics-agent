@@ -285,7 +285,9 @@ class Agent:
                     self.store.event(run_id, step, "action_started", {"decision": decision})
                     action_dispatched = True
                     result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
-                    if result.get("ok", False) and not result.get("skipped", False):
+                    if decision["action"] in self.tools.INPUT_ACTIONS:
+                        result["state_saved"] = False
+                    elif result.get("ok", False) and not result.get("skipped", False):
                         self.store.update(run_id, state=decision["state"])
                     action_data = {"decision": decision, "result": result,
                                    "recovery_context": recovery_context,

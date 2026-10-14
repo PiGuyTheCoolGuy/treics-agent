@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .config import Config, config_path, set_model, set_stall_attempts, validate_model_name, validate_stall_attempts
 from .checklist import Checklist
+from .click_review import inspection_region, marked_image
 from .model import Cancelled, ModelClient, ModelError, observation_text
 from .progress import ProgressGuard
 from .recovery import RecoveryMemory
@@ -245,6 +246,7 @@ class Agent:
         deadline = time.monotonic() + self.config.max_run_minutes * 60
         errors = 0
         screen = None
+        full_screen = None
         refresh_after_click_error = False
         progress = ProgressGuard(self.config.stall_attempts, self.stall_policy_version)
         recovery = RecoveryMemory()
@@ -253,6 +255,7 @@ class Agent:
             self._gate(deadline)
             self.set_phase("observing")
             screen = self.tools.desktop.capture()
+            full_screen = screen
             for step in range(1, run["max_steps"] + 1):
                 self._gate(deadline)
                 self.store.update(run_id, step=step)
@@ -264,6 +267,7 @@ class Agent:
                     if refresh_after_click_error:
                         self.set_phase("observing")
                         screen = self.tools.desktop.capture()
+                        full_screen = screen
                         refresh_after_click_error = False
                     self.set_phase("model")
                     started = time.monotonic()
@@ -316,6 +320,7 @@ class Agent:
                         self.store.update(run_id, status="completed", summary=summary)
                         return
                     previous_screen = screen
+                    previous_full_screen = full_screen
                     if decision["action"] in self.tools.GUI_ACTIONS:
                         self._gate(deadline)
                         self.set_phase("observing")
@@ -323,13 +328,17 @@ class Agent:
                             screen = self.tools.desktop.capture(result["capture_region"])
                         else:
                             screen = self.tools.desktop.capture()
+                            full_screen = screen
                     else:
                         screen = None
+                        full_screen = None
                         # A file/terminal tool can change the GUI; don't accept stale coordinates.
                         self.tools.desktop.invalidate_frame()
                     recovery.observe(decision, result, step, previous_screen, screen)
                     self._configure_progress(progress)
-                    reason = progress.observe(decision, result, previous_screen, screen)
+                    progress_before = (previous_full_screen if previous_screen and previous_screen.get("view") == "zoom"
+                                       and decision["action"] != "zoom_screenshot" else previous_screen)
+                    reason = progress.observe(decision, result, progress_before, screen)
                     if (reason and step < run["max_steps"]
                             and self._pause_stalled(run_id, step, reason, deadline, progress.attempt_limit, progress.revision)):
                         progress.reset()
@@ -337,6 +346,21 @@ class Agent:
                         self._gate(deadline)
                         self.set_phase("observing")
                         screen = self.tools.desktop.capture()
+                        full_screen = screen
+                    elif (decision["action"] == "click" and step < run["max_steps"] and recovery.click_review
+                          and recovery.click_review["screen_comparison"] == "essentially_unchanged"
+                          and result.get("last_click")):
+                        # Supply actual new pixels and a larger target, not just another retry warning.
+                        self._gate(deadline)
+                        region = inspection_region(screen, result["last_click"])
+                        inspection = self.tools.desktop.capture(region)
+                        recovery.inspect_click(inspection)
+                        screen = {**inspection, "base64": marked_image(inspection, result["last_click"])}
+                        self.store.event(run_id, step, "click_inspection", {
+                            "message": "No substantial change after the click. Captured a fresh zoom to identify the target and cause.",
+                            "desktop_region": inspection["source"],
+                            "last_click_in_image": recovery.click_review["inspection"]["last_click_in_image"],
+                        })
                 except (ModelError, ToolError, OSError, ValueError) as exc:
                     if self.stop_event.is_set():
                         raise Cancelled() from exc
@@ -356,6 +380,7 @@ class Agent:
                                          {"items": checklist.snapshot(), "message": "Recorded unsuccessful attempt."})
                     if isinstance(exc, (ToolError, OSError)):
                         screen = None
+                        full_screen = None
                         self.tools.desktop.invalidate_frame()
                         refresh_after_click_error = (refresh_after_click_error or
                                                      bool(decision and decision["action"] == "click" and action_dispatched))
@@ -368,6 +393,7 @@ class Agent:
                         self._gate(deadline)
                         self.set_phase("observing")
                         screen = self.tools.desktop.capture()
+                        full_screen = screen
                         continue
                     if self.stop_event.wait(min(errors * 2, 10)):
                         raise Cancelled()

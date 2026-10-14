@@ -28,6 +28,7 @@ class Config:
     ollama_url: str = "http://192.168.152.1:11435"
     ollama_token: str = ""
     model: str = "qwen3-vl:30b-a3b-instruct"
+    coordinate_space: str = "auto"
     num_thread: int = 16
     num_ctx: int = 8192
     num_predict: int = 1600
@@ -79,6 +80,8 @@ class Config:
         if url.path not in ("", "/") or url.query or url.fragment:
             raise ValueError("ollama_url must be the server origin, without an API path")
         validate_model_name(self.model)
+        if self.coordinate_space not in {"auto", "pixels", "normalized_1000"}:
+            raise ValueError("coordinate_space must be auto, pixels, or normalized_1000")
         if self.dashboard_token and len(self.dashboard_token) < 24:
             raise ValueError("dashboard_token must contain at least 24 characters")
 

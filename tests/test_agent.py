@@ -264,7 +264,7 @@ class AgentTests(unittest.TestCase):
         self.assertIsNotNone(model.screens[0])
         self.assertIsNone(model.screens[1])
         self.assertIsNotNone(model.screens[2])
-        self.assertEqual(self.desktop.captures, 3)
+        self.assertEqual(self.desktop.captures, 4)
         self.assertIn(["xdotool", "mousemove", "--sync", "960", "720"], self.desktop.commands)
 
     def test_coordinate_mapping_and_invalid_coordinates(self):

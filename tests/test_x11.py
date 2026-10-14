@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import json
 import os
 import secrets
 import selectors
@@ -10,13 +11,18 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from PIL import Image, ImageChops
 
+import test_agent
+
+from treics_agent.agent import Agent
 from treics_agent.config import Config
+from treics_agent.model import ModelClient
 from treics_agent.storage import Store
 from treics_agent.stream import DesktopStream
 from treics_agent.tools import Desktop, Tools
@@ -50,7 +56,7 @@ class X11Tests(unittest.TestCase):
             xvfb = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "800x600x24",
                                      *transports, "-auth", str(authority)],
                                     stdout=subprocess.PIPE, stderr=log)
-            desktop = store = client = live = None
+            desktop = store = client = live = agent = None
             try:
                 with selectors.DefaultSelector() as selector:
                     selector.register(xvfb.stdout, selectors.EVENT_READ)
@@ -159,7 +165,72 @@ class X11Tests(unittest.TestCase):
                 live.unsubscribe()
                 live.close()
                 self.assertIsNone(live.process)
+                # Exercise the actual Agent capture/input path after an ineffective click.
+                # A scripted model isolates coordinate mapping from model interpretation.
+                white = screen.default_colormap.alloc_named_color("#eeeeee").pixel
+                button = window.create_window(360, 244, 80, 32, 0, screen.root_depth,
+                                              X.InputOutput, X.CopyFromParent, background_pixel=white,
+                                              event_mask=X.ButtonPressMask | X.ButtonReleaseMask)
+                button.map()
+                client.sync()
+                while client.pending_events():
+                    client.next_event()
+                responses = iter([
+                    test_agent.decision("click", {"x": 500, "y": 583}),
+                    {**test_agent.decision("click", {"x": 500, "y": 266}), "click_assessment": {
+                        "intended_effect": "not_observed", "target_at_click": "Dialog body below the control",
+                        "cause": "First input missed the control", "evidence": "The control is above the last click ring",
+                        "next_step": "Click the actual close control"}},
+                    {**test_agent.decision("finish", {"summary": "Closed the synthetic dialog"}), "click_assessment": {
+                        "intended_effect": "observed", "target_at_click": "Close control", "cause": "No failure observed",
+                        "evidence": "The dialog is gone", "next_step": "Finish"}},
+                ])
+
+                class ScriptedClient(ModelClient):
+                    def __init__(self, config):
+                        super().__init__(config)
+                        self.payloads = []
+
+                    def request(self, method, path, payload=None, stop=None):
+                        self.payloads.append(payload)
+                        return {"message": {"content": json.dumps(next(responses))}}
+
+                model = ScriptedClient(cfg)
+                agent = Agent(cfg, store, tools, model)
+                run_id = agent.start("Close the synthetic dialog", 10)
+                delivered = []
+                closed = False
+                deadline = time.monotonic() + 12
+                while agent.thread.is_alive() and time.monotonic() < deadline:
+                    while client.pending_events():
+                        event = client.next_event()
+                        if event.type == X.ButtonPress:
+                            delivered.append((event.window.id, event.event_x, event.event_y))
+                            if event.window.id == button.id and not closed:
+                                window.destroy()  # The test GUI's close-button handler.
+                                client.sync()
+                                closed = True
+                    time.sleep(0.01)
+                agent.thread.join(1)
+                self.assertFalse(agent.thread.is_alive(), store.run(run_id))
+                self.assertTrue(closed, delivered)
+                self.assertIn((window.id, 400, 350), delivered)
+                self.assertIn((button.id, 40, 16), delivered)
+                self.assertEqual(store.run(run_id)["status"], "completed")
+                inspection_context = json.loads(model.payloads[1]["messages"][-1]["content"])
+                self.assertEqual(inspection_context["screen"]["view"], "zoom")
+                self.assertEqual(inspection_context["screen"]["source"], {"x": 144, "y": 158, "width": 512, "height": 384})
+                self.assertEqual(inspection_context["recovery"]["click_review"]["inspection"]["last_click_in_image"],
+                                 {"x": 500, "y": 500})
+                self.assertEqual(len(model.payloads[1]["messages"]), 2)
+                finish_context = json.loads(model.payloads[2]["messages"][-1]["content"])
+                self.assertEqual(finish_context["recovery"]["click_review"]["screen_comparison"], "changed")
+                inputs = [event["data"]["result"]["last_click"] for event in store.events(run_id)
+                          if event["kind"] == "action" and event["data"]["decision"]["action"] == "click"]
+                self.assertEqual([(item["x"], item["y"]) for item in inputs], [(400, 350), (400, 260)])
             finally:
+                if agent:
+                    agent.shutdown()
                 if live:
                     live.close()
                 if desktop:

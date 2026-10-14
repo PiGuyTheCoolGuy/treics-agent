@@ -511,7 +511,8 @@ class Tools:
                 return {"ok": True, "capture_region": region,
                         "message": "A fresh zoomed image will be attached next. Use its local pixel coordinates "
                                    "for click/move/drag/scroll; the controller adds the crop offset and "
-                                   "handles scaling. The next ordinary GUI action restores the full view."}
+                                   "handles scaling. Ordinary GUI actions recapture the full view; an unchanged click "
+                                   "may supply a fresh zoom inspection. Check the next screen.view."}
             if action in ("click", "move", "drag"):
                 x, y = d.coordinates(a["x"], a["y"])
                 if action == "click":

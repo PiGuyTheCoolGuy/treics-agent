@@ -8,7 +8,9 @@ The default model is **`qwen3-vl:30b-a3b-instruct`**, the quantized vision model
 
 - See the desktop, click, double-click, right-click, drag, scroll, paste Unicode text, and use keyboard shortcuts.
 - Inspect small targets with `zoom_screenshot`; clicks in the crop map back to the desktop automatically.
+- Convert Qwen3-VL's normalized mouse coordinates correctly for the full desktop and zoomed views.
 - Review each click against a fresh screenshot and marked before/after close-ups, then choose a correction when the intended effect is missing.
+- Automatically inspect clicks with no substantial visible change using a fresh native zoom that marks the last point and asks the model to identify the actual control and cause.
 - See a red last-click crosshair on the live desktop/VNC and dashboard preview, with coordinates in the log.
 - Stream the desktop and mouse pointer to the dashboard while the model is thinking, paused, or idle.
 - Open Firefox, run Bash commands, read/write files, install guest software with `sudo`, and verify its work.

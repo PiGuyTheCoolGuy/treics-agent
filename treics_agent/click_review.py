@@ -7,6 +7,44 @@ import math
 from PIL import Image, ImageDraw, ImageOps
 
 
+def inspection_region(frame: dict, target: dict) -> dict:
+    """Choose a native desktop crop with enough surrounding context to find another control."""
+    desktop_width, desktop_height = frame["desktop_width"], frame["desktop_height"]
+    x, y = target["x"], target["y"]
+    if not 0 <= x < desktop_width or not 0 <= y < desktop_height:
+        raise ValueError("The recorded click lies outside the current desktop.")
+    width, height = min(512, desktop_width), min(384, desktop_height)
+    return {"x": max(0, min(x - width // 2, desktop_width - width)),
+            "y": max(0, min(y - height // 2, desktop_height - height)),
+            "width": width, "height": height, "scale": 3,
+            "desktop_width": desktop_width, "desktop_height": desktop_height}
+
+
+def image_point(frame: dict, target: dict) -> dict | None:
+    source = frame["source"]
+    x, y = target["x"] - source["x"], target["y"] - source["y"]
+    if not 0 <= x < source["width"] or not 0 <= y < source["height"]:
+        return None
+    return {"x": min(frame["width"] - 1, round(x * frame["width"] / source["width"])),
+            "y": min(frame["height"] - 1, round(y * frame["height"] / source["height"]))}
+
+
+def marked_image(frame: dict, target: dict) -> str:
+    """Mark the last input on the model's current image without changing its geometry."""
+    point = image_point(frame, target)
+    if point is None:
+        return frame["base64"]
+    with Image.open(io.BytesIO(base64.b64decode(frame["base64"]))) as original:
+        image = original.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    x, y = point["x"], point["y"]
+    draw.ellipse((x - 9, y - 9, x + 9, y + 9), outline="white", width=4)
+    draw.ellipse((x - 8, y - 8, x + 8, y + 8), outline="#ff4040", width=2)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=85)
+    return base64.b64encode(output.getvalue()).decode()
+
+
 def comparison_image(before: dict | None, after: dict | None, target: dict | None) -> dict:
     """Make reference-only crops around the executed click, without changing action coordinates."""
     if not before or not after or not target:

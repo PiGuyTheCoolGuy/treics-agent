@@ -487,7 +487,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(payload["messages"][1]["content"])["filesystem"], filesystem)
         cases = {c["properties"]["action"]["enum"][0]: c for c in payload["format"]["anyOf"]}
         self.assertIn("finish", cases)
-        self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 767)
+        self.assertEqual(cases["click"]["properties"]["arguments"]["properties"]["y"]["maximum"], 1000)
         # The simulated model answers immediately; wait for the gateway's
         # request cleanup before sending another inference request.
         self.assertTrue(self.proxy.inference.acquire(timeout=2))

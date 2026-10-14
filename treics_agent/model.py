@@ -10,12 +10,13 @@ import threading
 from urllib.parse import urlsplit
 
 from .config import Config, validate_model_name
+from .coordinates import coordinate_space, model_history, model_recovery, model_screen, to_pixels
 from .checklist import CHECKLIST_PROMPT, ITEM_SCHEMA, UPDATES_SCHEMA
 
 
 TOOLS = {
     "screenshot": "{}: capture a fresh screen before choosing coordinates.",
-    "zoom_screenshot": '{"x":int,"y":int,"width":int,"height":int,"scale":int optional}: inspect a rectangle of the CURRENT screenshot at higher detail. x/y are its top-left pixel; width/height must fit inside it. Native pixels are enlarged by scale (default 3, range 2–6), capped at the normal image budget. The next image uses LOCAL crop coordinates.',
+    "zoom_screenshot": '{"x":int,"y":int,"width":int,"height":int,"scale":int optional}: inspect a rectangle of the CURRENT screenshot at higher detail. x/y and width/height use action_coordinate_system and must fit inside it. Native pixels are enlarged by scale (default 3, range 2–6), capped at the normal image budget. The next image uses LOCAL crop coordinates.',
     "click": '{"x":int,"y":int,"button":"left|right|middle","clicks":1|2}',
     "move": '{"x":int,"y":int}: move the pointer.',
     "drag": '{"x":int,"y":int,"end_x":int,"end_y":int,"duration":number}: drag from start to end.',
@@ -77,13 +78,16 @@ ARGUMENT_SCHEMAS = {
 
 CLICK_ASSESSMENT_SCHEMA = arguments_schema({
     "intended_effect": {"enum": ["observed", "not_observed", "uncertain"]},
+    "target_at_click": {"type": "string", "minLength": 1, "maxLength": 100},
+    "cause": {"type": "string", "minLength": 1, "maxLength": 140},
     "evidence": {"type": "string", "minLength": 1, "maxLength": 200},
     "next_step": {"type": "string", "minLength": 1, "maxLength": 160},
 })
 
 
 def decision_schema(screen: dict | None = None, task_checklist: bool = False,
-                    require_checklist: bool = False, review_click: bool = False) -> dict:
+                    require_checklist: bool = False, review_click: bool = False,
+                    coordinate_space: str = "pixels") -> dict:
     cases = []
     for action, arguments in ARGUMENT_SCHEMAS.items():
         if action == "set_checklist" and not task_checklist:
@@ -94,10 +98,11 @@ def decision_schema(screen: dict | None = None, task_checklist: bool = False,
         if screen:
             for key in ("x", "end_x", "y", "end_y"):
                 if key in properties:
-                    properties[key]["maximum"] = screen["width" if key.endswith("x") else "height"] - 1
+                    properties[key]["maximum"] = (1000 if coordinate_space == "normalized_1000" else
+                                                   screen["width" if key.endswith("x") else "height"] - 1)
             if action == "zoom_screenshot":
                 for key in ("width", "height"):
-                    properties[key]["maximum"] = screen[key]
+                    properties[key]["maximum"] = 1000 if coordinate_space == "normalized_1000" else screen[key]
         cases.append({"type": "object", "additionalProperties": False,
                       "properties": {"action": {"enum": [action]},
                                      "arguments": {**arguments, "properties": properties},
@@ -134,27 +139,41 @@ For browser navigation prefer open_browser. For type, omit paste_keys to use Ctr
 never send an empty paste_keys array. Tool errors identify the action that actually failed.
 Function keys and common named keys are normalized regardless of capitalization: f4 sends F4.
 Ordinary letter case remains significant. keys_sent reports the normalized shortcut, not its UI effect.
-For GUI work, inspect screenshots and use screenshot pixel coordinates (origin at top left).
-The controller maps screenshot coordinates to the actual desktop. Do not rescale them yourself.
+For GUI work, inspect screenshots and follow action_coordinate_system (origin at top left).
+The controller maps action coordinates to the actual desktop. Do not add native offsets yourself.
 For small or uncertain targets, call zoom_screenshot with a rectangle in the current image.
-The resulting screen.view="zoom" image starts at local (0,0). Use pixel coordinates in THAT
+The resulting screen.view="zoom" image starts at local (0,0). Locate coordinates in THAT
 image for click/move/drag/scroll; never add screen.source offsets or divide by zoom yourself.
 Nested zooms also use the latest image's local coordinates. screenshot restores the full view.
-After any ordinary GUI action the next image is full desktop again; use its new coordinates.
+Ordinary GUI actions recapture the full desktop. After an unchanged click, the controller may
+supply a fresh zoom inspection instead. Check screen.view, source and dimensions every turn;
+use the coordinates of that latest image.
 Prefer hotkey ["alt","F4"] to close the active window, and other reliable keyboard shortcuts.
 XFCE's top panel has an "agent" account menu; it is not a window's close button. Locate
 the X on the actual window title bar, which may be below that panel. If a popup covers
 the target or an unexpected menu opens after a click, dismiss it with press Escape first,
 then inspect the fresh screenshot and zoom the intended control. Do not reuse obscured
 or previous-image coordinates. Escape dismisses a menu; it does not close the browser.
-The human desktop preview marks the last executed click. Your current full screenshot is clean.
+The human desktop preview marks the last executed click. Ordinary model screenshots are clean.
 When recovery.click_review is present, compare the last click's intent with the fresh screenshot
 before choosing the next action. When attached, a preceding reference image shows BEFORE on the
 left and AFTER on the right, enlarged around the actual click and marked with a red ring. If the
 comparison is unavailable, assess the current screenshot and reported target. These reference crops
 are not a coordinate surface: select actions using ONLY the newest screen image and its dimensions.
 Return click_assessment with intended_effect (observed/not_observed/uncertain), short visible
-evidence, and the next corrective step. This is an outcome check, not a reasoning transcript.
+evidence, target_at_click (the actual control/area under the last click), cause (visible cause
+or unknown if not established), and the next corrective step. This is an outcome check, not a
+reasoning transcript. Saying only "the dialog is still open" does not identify the target or cause.
+When click_review.inspection is present, the current image is a freshly captured native zoom,
+with a red ring around the previous executed click. last_click_in_image locates that point in
+THIS image. The ring marks historical input, not the correct target. Read the actual control
+under it and locate the intended control in the enlarged view before selecting coordinates.
+The image's origin is (0,0); use the declared coordinate grid of this crop, not the full desktop.
+Use screenshot to restore the full view if the intended control is outside the inspection crop.
+Input was already sent: do not assume it was not registered just because the dialog remains.
+If the cause is unknown, choose an observation/focus/dismissal/shortcut appropriate to the task
+instead of treating another identical click as a diagnosis. A repeat remains appropriate when
+you identify a visible changed precondition or a task that actually requires repeated input.
 Check the actual control under the ring, window focus, menus covering the target, and whether
 the intended window/dialog changed. A different popup is not the intended result. If it did not
 work, identify the visible cause and act on it: dismiss an obstruction, zoom an uncertain control,
@@ -163,8 +182,9 @@ old point at random. If the cause is unclear, inspect/zoom or wait for a pending
 An essentially unchanged image is only a heuristic; inspect small controls too. Intentional
 repeated clicks remain allowed when the visible state and task justify them; explain that in
 click_assessment.next_step. Never claim success merely because input was delivered.
-Coordinates are separate integer x and y fields, never an array. Use literal image pixels,
-not a normalized 0-1000 scale. x must be less than screen.width; y less than screen.height.
+Coordinates are separate integer x and y fields, never an array. Follow action_coordinate_system
+for all point and zoom rectangle arguments. Native desktop targets in tool results are historical
+observations, not coordinates to copy into a new action.
 The image attached to the current user message is available now: inspect it directly.
 Do not repeatedly request screenshots when a current image is already attached.
 Only the newest image is current. After terminal/file/memory actions there is no current image;
@@ -375,6 +395,23 @@ def recent_observations(events: list[dict], include_event_ids: bool = False) -> 
     return observations
 
 
+def inspection_observations(events: list[dict], include_event_ids: bool = False) -> list[dict]:
+    """Keep observed history, without replaying failed point proposals or obsolete next-step plans."""
+    observations = recent_observations(events, include_event_ids)
+    for observation in observations:
+        data = observation["data"]
+        if data.get("action") == "click":
+            data.pop("arguments", None)
+            data["historical_coordinates_omitted"] = True
+            if "result" in data:
+                data["result"] = {key: value for key, value in data["result"].items()
+                                  if key != "last_click"}
+        if "click_assessment" in data:
+            data["click_assessment"] = {key: value for key, value in data["click_assessment"].items()
+                                         if key != "next_step"}
+    return observations
+
+
 class ModelClient:
     def __init__(self, config: Config):
         self.config = config
@@ -474,13 +511,27 @@ class ModelClient:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
                           if self.config.task_checklist or name != "set_checklist")
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
+        space = coordinate_space(self.config.model, self.config.coordinate_space)
+        if space == "normalized_1000":
+            prompt += ("\nThe coordinate screen's resolution is 1000x1000. For every mouse point, drag endpoint and "
+                       "zoom rectangle, use relative coordinates from 0 to 1000 across the CURRENT image. "
+                       "Do not output raw pixels or multiply by image resolution; the controller converts once. "
+                       "The image keeps its original aspect ratio. screen.pixel_width/pixel_height are encoded "
+                       "image metadata only. last_click_in_image uses this same 0–1000 grid.\n")
+        else:
+            prompt += ("\nUse literal pixels in the CURRENT image for every mouse point, drag endpoint and zoom "
+                       "rectangle. Do not use normalized 0–1000 coordinates. x < screen.width; y < screen.height.\n")
+        inspection = bool(((recovery or {}).get("click_review") or {}).get("inspection"))
+        observations = (inspection_observations(events, self.config.task_checklist) if inspection else
+                        recent_observations(events, self.config.task_checklist))
         context = {
             "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
-            "recent_events": recent_observations(events, self.config.task_checklist),
+            "recent_events": model_history(observations, events, space),
+            "action_coordinate_system": space,
             "step_budget": budget,
             "filesystem": filesystem,
-            "screen": ({k: v for k, v in screen.items() if k != "base64"} if screen else None),
+            "screen": model_screen(screen, space),
             "task": task,
         }
         if self.config.task_checklist:
@@ -490,14 +541,14 @@ class ModelClient:
             context["task"] = task
         if recovery is not None:
             context.pop("task")
-            context["recovery"] = recovery
+            context["recovery"] = model_recovery(recovery, screen, space)
             context["task"] = task
         user = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
         if screen:
             user["images"] = [screen["base64"]]
         review_click = bool(screen and recovery and recovery.get("click_review"))
         messages = []
-        if review_click and click_review_image:
+        if review_click and click_review_image and not inspection:
             messages.append({"role": "user", "content": "Reference comparison for the last click: BEFORE on the left, "
                              "AFTER on the right; red rings mark the actual click. These are historical crops, "
                              "not coordinates for the next action. The following message has the current full screenshot.",
@@ -506,6 +557,7 @@ class ModelClient:
                           '"reason":"short description", "state":"observed progress and next step"}')
         if review_click:
             response_shape = ('\nResponse shape: {"click_assessment":{"intended_effect":"observed|not_observed|uncertain", '
+                              '"target_at_click":"visible control under the last click", "cause":"visible cause or unknown", '
                               '"evidence":"short visible observation", "next_step":"correction or justified continuation"}, '
                               '"action":"tool name", "arguments":{tool-specific fields}, '
                               '"reason":"short description", "state":"observed progress and next step"}')
@@ -515,7 +567,7 @@ class ModelClient:
                 {"role": "system", "content": prompt + "\nTools:\n" + tools +
                  response_shape}, *messages, user],
             "format": decision_schema(screen, self.config.task_checklist,
-                                      self.config.task_checklist and not checklist, review_click), "stream": False,
+                                      self.config.task_checklist and not checklist, review_click, space), "stream": False,
             "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
@@ -531,4 +583,11 @@ class ModelClient:
             raise ModelError("Ollama returned no message content.") from exc
         metrics = {key: result[key] for key in ("total_duration", "load_duration", "prompt_eval_count",
                    "prompt_eval_duration", "eval_count", "eval_duration") if key in result}
+        try:
+            arguments, mapping = to_pixels(decision["action"], decision["arguments"], screen, space)
+        except ValueError as exc:
+            raise ModelError(str(exc)) from exc
+        decision["arguments"] = arguments
+        if mapping:
+            metrics["coordinate_mapping"] = mapping
         return decision, metrics

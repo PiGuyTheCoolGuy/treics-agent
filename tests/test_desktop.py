@@ -83,7 +83,7 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "No current screenshot"):
             self.tools.execute("zoom_screenshot", arguments, self.stop)
 
-    def test_agent_keeps_zoom_until_action_then_restores_full_view_and_logs_click(self):
+    def test_agent_keeps_zoom_until_action_then_inspects_an_unchanged_click(self):
         model = FakeModel([decision("zoom_screenshot", {"x": 900, "y": 50, "width": 100, "height": 60}),
                            decision("click", {"x": 300, "y": 150}),
                            decision("finish", {"summary": "Clicked zoom target"})])
@@ -93,7 +93,10 @@ class DesktopTests(unittest.TestCase):
             agent.thread.join(5)
             self.assertFalse(agent.thread.is_alive())
             self.assertEqual(self.store.run(run_id)["status"], "completed")
-            self.assertEqual([screen["view"] for screen in model.screens], ["desktop", "zoom", "desktop"])
+            self.assertEqual([screen["view"] for screen in model.screens], ["desktop", "zoom", "zoom"])
+            self.assertEqual(model.screens[2]["source"], {"x": 1408, "y": 0, "width": 512, "height": 384})
+            self.assertEqual(model.recoveries[2]["click_review"]["inspection"]["last_click_in_image"],
+                             {"x": 758, "y": 286})
             self.assertIn(["xdotool", "mousemove", "--sync", "1787", "143"], self.desktop.commands)
             click = next(event["data"]["result"]["last_click"] for event in self.store.events(run_id)
                          if event["kind"] == "action" and event["data"]["decision"]["action"] == "click")

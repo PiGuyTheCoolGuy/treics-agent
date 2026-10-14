@@ -6,7 +6,7 @@ import json
 from collections import OrderedDict, deque
 
 from .model import compact_arguments, observation_text
-from .click_review import comparison_image
+from .click_review import comparison_image, image_point
 from .progress import ProgressGuard
 from .tools import Tools
 
@@ -31,6 +31,18 @@ class RecoveryMemory:
 
     def consume_click_review(self) -> None:
         self.click_review = None
+        self.click_review_image = None
+
+    def inspect_click(self, screen: dict) -> None:
+        if not self.click_review or not self.click_review.get("desktop_target"):
+            return
+        self.click_review["inspection"] = {
+            "captured_at": screen.get("captured_at"), "desktop_region": screen["source"],
+            "last_click_in_image": image_point(screen, self.click_review["desktop_target"]),
+        }
+        # Old proposal coordinates belong to a different image; retain the factual native target.
+        self.click_review.pop("arguments", None)
+        self.click_review["reference_crop"] = None
         self.click_review_image = None
 
     def _clear_gui(self) -> None:
@@ -201,6 +213,10 @@ class RecoveryMemory:
             context["click_review"] = copy.deepcopy(self.click_review)
         if self.repeated_observation and self.repeated_observation["matching_calls"] >= 2:
             context["repeated_observation"] = copy.deepcopy(self.repeated_observation)
+        if self.click_review and self.click_review.get("inspection"):
+            for name in ("gui_feedback", "repeated_observation"):
+                if context.get(name, {}).get("action") == "click":
+                    context[name].pop("arguments", None)
         for item in reversed(self.failures.values()):
             selected = copy.deepcopy(item)
             if self.last_change_step > item["last_failed_step"]:

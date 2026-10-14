@@ -67,6 +67,9 @@ class ProgressGuard:
         arguments = decision["arguments"]
         if action == "set_checklist":
             arguments = {key: value for key, value in arguments.items() if key != "revision_reason"}
+        elif action == "click" and result.get("last_click"):
+            # Full-view and zoom-local coordinates can describe the same executed input.
+            arguments = {key: result["last_click"][key] for key in ("x", "y", "button", "clicks")}
         signature = json.dumps([action, arguments], sort_keys=True, ensure_ascii=False)
         if action in Tools.GUI_ACTIONS:
             self.last_text_result = None

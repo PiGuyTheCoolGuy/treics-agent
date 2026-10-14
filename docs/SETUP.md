@@ -86,6 +86,8 @@ In the dashboard's **Model** panel, select an installed model and click **Use mo
 
 The list loads when you connect. **Refresh models** updates it after a host model install or gateway allowlist change. Models must be installed and allowed by the gateway to appear. The controller rejects models that report no vision support because tasks begin with a screenshot. Older Ollama versions that omit capability metadata remain supported; use `doctor --test-model` to check their image handling.
 
+Qwen3-VL returns mouse positions on a 0–1000 relative grid, rather than literal screenshot pixels. The controller now declares that convention and converts points and zoom rectangles before sending desktop input. For example, `(504, 565)` on that grid becomes approximately `(516, 434)` on a 1024×768 image. Existing configs default to `coordinate_space = "auto"`: Qwen3-VL names use the relative grid, and other model names use image pixels. For custom aliases or models with a different convention, set `coordinate_space` to `"normalized_1000"` or `"pixels"` in the guest config and restart the controller. Action Details include `metrics.coordinate_mapping` with both coordinate sets. Images keep their original aspect ratio, and zoomed views use the same conversion. See [Qwen's official clarification](https://github.com/QwenLM/Qwen3-VL/issues/1521).
+
 To adjust other settings or edit the model manually, inside the VM:
 
 ```bash
@@ -169,6 +171,8 @@ bash scripts/ssh-vm.sh 'DISPLAY=:99 XAUTHORITY="$HOME/.Xauthority" xdotool key -
 For a mouse-close test, explicitly allow Escape to dismiss obstructing menus while requiring a click on the actual browser title-bar X to close the window. Its title bar is below XFCE's top panel. The live feed shows desktop changes while the model is thinking; an unchanged screen can simply mean the desktop is idle. The dashboard activity timer and controls should continue updating. A browser request timeout reports a dashboard/tunnel problem and does not itself stop the task or shorten the model's inference timeout.
 
 After each click, the controller captures the full desktop and asks the model to review its intended effect against that image and marked before/after close-ups. The next action log includes `decision.click_assessment` with the visible evidence and corrective step. This check shares the ordinary next model call; it does not add an inference step or limit repeated clicks. Wrong popups are reviewed even when the image changed. A correct correction still depends on the model's interpretation. Manual Pause/Stop and your optional stall count continue to control retries.
+
+If the full desktop is essentially unchanged, the next model image is instead a fresh native zoom around the executed click, marked with a red ring. The assessment must identify `target_at_click` and `cause`, as well as visible evidence and its next step. `click_inspection` records this capture in the activity log. The ring identifies where input went; it does not identify the correct button. The model can request the full screenshot when the intended control is outside the crop. Inspection uses one image and the ordinary next model call; it does not block repeated inputs. Old point proposals and retry plans are omitted from that inspection's model history, while the saved activity log remains complete.
 
 For an immediate halt of **all** guest activity, power off the VM from the host. A normal shutdown is preferable when it is responsive:
 

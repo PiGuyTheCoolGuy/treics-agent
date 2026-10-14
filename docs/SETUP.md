@@ -80,10 +80,6 @@ For automatic pausing, choose **Pause automatically**, set the number of **match
 
 The saved guest setting is `stall_attempts = 0` for manual control, or a positive repeat count for automatic pausing. Existing configurations without this field use manual control automatically. No model download or host gateway update is needed.
 
-**Click controls** separately prevent repeated mouse input even in manual stall mode. The default is `click_repeat_limit = 2`, including older configurations without this field: at most two click attempts at the same desktop point/button are allowed on a visually similar scene before repeats are withheld. Remembered scenes also catch popup open/close cycles. Guarded clicks refresh the desktop first; a stale model image is withheld too. A **blocked** log entry means no mouse input was sent. The model must choose a different kind of action on its next turn, and the task stays active rather than automatically pausing.
-
-Choose **Limit repeated clicks**, enter 1–1,000, and click **Apply click controls**, or choose **Allow all clicks** to disable the guard (`click_repeat_limit = 0`). Changes are saved and apply during the task. Apply, a new task, and explicit Resume reset click history; changing settings does not itself resume a paused run. The guard relies on visual similarity and can withhold deliberate repetition on similar-looking screens, so choose the limit for your task. It covers the model's structured click tool and does not restrict arbitrary shell GUI automation.
-
 ## 4. Configure or switch models
 
 In the dashboard's **Model** panel, select an installed model and click **Use model**. The new selection applies immediately to future tasks and is saved in the guest configuration for restarts. Finish or stop the current task first; paused tasks keep their original model. The history shows each run's model so you can compare results. A failed check or save leaves the previous selection active.
@@ -172,6 +168,8 @@ bash scripts/ssh-vm.sh 'DISPLAY=:99 XAUTHORITY="$HOME/.Xauthority" xdotool key -
 
 For a mouse-close test, explicitly allow Escape to dismiss obstructing menus while requiring a click on the actual browser title-bar X to close the window. Its title bar is below XFCE's top panel. The live feed shows desktop changes while the model is thinking; an unchanged screen can simply mean the desktop is idle. The dashboard activity timer and controls should continue updating. A browser request timeout reports a dashboard/tunnel problem and does not itself stop the task or shorten the model's inference timeout.
 
+After each click, the controller captures the full desktop and asks the model to review its intended effect against that image and marked before/after close-ups. The next action log includes `decision.click_assessment` with the visible evidence and corrective step. This check shares the ordinary next model call; it does not add an inference step or limit repeated clicks. Wrong popups are reviewed even when the image changed. A correct correction still depends on the model's interpretation. Manual Pause/Stop and your optional stall count continue to control retries.
+
 For an immediate halt of **all** guest activity, power off the VM from the host. A normal shutdown is preferable when it is responsive:
 
 ```bash
@@ -252,7 +250,7 @@ This controller can access everything that guest user can access. Install it in 
 | No screenshot / X11 error | In guest: `systemctl --user status treic-desktop`, `DISPLAY=:99 XAUTHORITY=~/.Xauthority xdpyinfo`. |
 | Shortcut fails because of capitalization | Update the controller. Keyboard tools normalize function/common key names (`f4` → `F4`) and log `keys_sent`. Unknown names produce an error before input; check focus and the next screenshot if a valid shortcut has no effect. |
 | Repeated actions/errors | Inspect the activity log's result and `recovery_context`: short failed commands, cwd, error/status, and repeat counts remain visible to the model beyond recent history. Fresh path metadata may show a changed precondition. Use Pause/Stop in manual mode, or choose a repeat count in Stall controls. |
-| Same click coordinates keep repeating | Update the guest controller, refresh the dashboard, and check Click controls. The default limit is two matching attempts per similar scene; further structured clicks are logged as **blocked** and send no mouse input. Inspect `recovery_context.click_guard` and the displayed withheld-click reason. Raise/disable the limit for intentional repetition. The guard cannot guarantee correct target interpretation. |
+| Same click coordinates keep repeating | Update the controller and inspect `decision.click_assessment` in the next action log: the model reviews a fresh full screenshot and marked before/after close-ups, then records the visible evidence and next corrective step. `recovery_context.click_review` identifies the reviewed click, and `gui_feedback` retains repeat counts. Input results remain `ui_effect_verified=false`; the model's assessment is not independent proof of success. Manual retry controls remain available. |
 | Model emits truncated JSON | Keep actions smaller; raise `num_predict` up to gateway limit 4096 if required. |
 | Dashboard is unreachable | Keep the laptop SSH tunnel open; check guest `systemctl --user status treics-agent`. |
 | Another controller is running | Use the existing dashboard. Stop the service before using the standalone `run` command. |

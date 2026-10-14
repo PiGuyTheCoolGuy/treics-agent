@@ -8,51 +8,6 @@ from pathlib import Path
 
 @unittest.skipUnless(shutil.which("node"), "Node is unavailable for dashboard request tests")
 class DashboardTests(unittest.TestCase):
-    def test_click_controls_preserve_custom_limit_and_allow_disabling_during_tasks(self):
-        script = r'''
-const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
-const elements=new Map();
-const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='clickMode'?'on':id==='clickAttempts'?'2':'',textContent:'',disabled:false});return elements.get(id)};
-const context=vm.createContext({document:{getElementById:element}});
-vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
-let fail=false,saved=0,finish;
-const calls=[];
-const controls=new context.ClickControls(async(path,body)=>{
-  calls.push(JSON.parse(JSON.stringify({path,body})));
-  if(fail)throw new Error('disk error');
-  return new Promise(resolve=>{finish=()=>resolve({click_repeat_limit:body.click_repeat_limit})});
-},async()=>{saved++});
-(async()=>{
-  controls.update({click_repeat_limit:2,task_active:true});
-  assert.equal(element('clickMode').value,'on');
-  assert.match(element('clickGuardStatus').textContent,/Allow 2/);
-  element('clickAttempts').value='8';element('clickAttempts').oninput();
-  controls.update({click_repeat_limit:2,task_active:true});
-  assert.equal(element('clickAttempts').value,'8','Polling erased the draft');
-  const pending=controls.save();assert.equal(element('saveClick').disabled,true);finish();await pending;
-  assert.deepEqual(calls[0],{path:'/api/click-guard',body:{click_repeat_limit:8}});
-  assert.equal(controls.current,8);assert.equal(saved,1);
-  for(const value of ['','0','1.5','1001']){
-    element('clickAttempts').value=value;element('clickAttempts').oninput();await controls.save();
-    assert.equal(calls.length,1);
-  }
-  element('clickMode').value='off';element('clickMode').onchange();
-  fail=true;await controls.save();assert.equal(controls.current,8);assert.equal(element('saveClick').disabled,false);
-  assert.match(element('clickGuardStatus').textContent,/disk error/);
-  fail=false;const off=controls.save();finish();await off;
-  assert.equal(controls.current,0);
-  assert.deepEqual(calls.at(-1),{path:'/api/click-guard',body:{click_repeat_limit:0}});
-  controls.update({click_repeat_limit:5,stall_setting_saving:true});
-  assert.equal(element('saveClick').disabled,true);assert.equal(element('clickMode').disabled,true);
-  controls.update({click_repeat_limit:5});
-  assert.equal(Number(element('clickAttempts').value),5);
-  assert.match(element('clickGuardStatus').textContent,/Allow 5/);
-})().catch(error=>{console.error(error);process.exitCode=1});
-'''
-        path = Path(__file__).resolve().parents[1] / "treics_agent/static/click-controls.js"
-        result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True, timeout=5)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_stall_controls_keep_manual_default_preserve_drafts_and_apply_custom_counts(self):
         script = r'''
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
@@ -267,7 +222,6 @@ const context = vm.createContext({
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
 vm.runInContext(fs.readFileSync(process.argv[4], 'utf8'), context);
-vm.runInContext(fs.readFileSync(process.argv[5], 'utf8'), context);
 vm.runInContext(source, context);
 function stall(signal) {
   return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
@@ -300,8 +254,7 @@ function stall(signal) {
 '''
         path = Path(__file__).resolve().parents[1] / "treics_agent/static/index.html"
         result = subprocess.run(["node", "-e", script, str(path), str(path.with_name("desktop-stream.js")),
-                                 str(path.with_name("model-selector.js")), str(path.with_name("stall-controls.js")),
-                                 str(path.with_name("click-controls.js"))],
+                                 str(path.with_name("model-selector.js")), str(path.with_name("stall-controls.js"))],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

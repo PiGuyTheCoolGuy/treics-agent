@@ -75,13 +75,17 @@ ARGUMENT_SCHEMAS = {
                                          "revision_reason": {"type": "string", "maxLength": 240}}),
 }
 
+CLICK_ASSESSMENT_SCHEMA = arguments_schema({
+    "intended_effect": {"enum": ["observed", "not_observed", "uncertain"]},
+    "evidence": {"type": "string", "minLength": 1, "maxLength": 200},
+    "next_step": {"type": "string", "minLength": 1, "maxLength": 160},
+})
+
 
 def decision_schema(screen: dict | None = None, task_checklist: bool = False,
-                    require_checklist: bool = False, exclude_click: bool = False) -> dict:
+                    require_checklist: bool = False, review_click: bool = False) -> dict:
     cases = []
     for action, arguments in ARGUMENT_SCHEMAS.items():
-        if action == "click" and exclude_click:
-            continue
         if action == "set_checklist" and not task_checklist:
             continue
         if require_checklist and action not in {"set_checklist", "finish"}:
@@ -102,7 +106,12 @@ def decision_schema(screen: dict | None = None, task_checklist: bool = False,
                       "required": ["reason", "action", "arguments", "state"]})
         if task_checklist:
             cases[-1]["properties"]["checklist_updates"] = UPDATES_SCHEMA
-    return {"type": "object", "required": ["reason", "action", "arguments", "state"], "anyOf": cases}
+        if review_click:
+            cases[-1]["properties"] = {"click_assessment": CLICK_ASSESSMENT_SCHEMA,
+                                       **cases[-1]["properties"]}
+            cases[-1]["required"].insert(0, "click_assessment")
+    return {"type": "object", "required": (["click_assessment"] if review_click else []) +
+            ["reason", "action", "arguments", "state"], "anyOf": cases}
 
 
 DECISION_SCHEMA = decision_schema()
@@ -138,7 +147,22 @@ the X on the actual window title bar, which may be below that panel. If a popup 
 the target or an unexpected menu opens after a click, dismiss it with press Escape first,
 then inspect the fresh screenshot and zoom the intended control. Do not reuse obscured
 or previous-image coordinates. Escape dismisses a menu; it does not close the browser.
-The human desktop preview marks the last executed click. That marker is excluded from your image.
+The human desktop preview marks the last executed click. Your current full screenshot is clean.
+When recovery.click_review is present, compare the last click's intent with the fresh screenshot
+before choosing the next action. When attached, a preceding reference image shows BEFORE on the
+left and AFTER on the right, enlarged around the actual click and marked with a red ring. If the
+comparison is unavailable, assess the current screenshot and reported target. These reference crops
+are not a coordinate surface: select actions using ONLY the newest screen image and its dimensions.
+Return click_assessment with intended_effect (observed/not_observed/uncertain), short visible
+evidence, and the next corrective step. This is an outcome check, not a reasoning transcript.
+Check the actual control under the ring, window focus, menus covering the target, and whether
+the intended window/dialog changed. A different popup is not the intended result. If it did not
+work, identify the visible cause and act on it: dismiss an obstruction, zoom an uncertain control,
+or select a newly observed target/appropriate shortcut within the user's task. Do not nudge the
+old point at random. If the cause is unclear, inspect/zoom or wait for a pending UI update.
+An essentially unchanged image is only a heuristic; inspect small controls too. Intentional
+repeated clicks remain allowed when the visible state and task justify them; explain that in
+click_assessment.next_step. Never claim success merely because input was delivered.
 Coordinates are separate integer x and y fields, never an array. Use literal image pixels,
 not a normalized 0-1000 scale. x must be less than screen.width; y less than screen.height.
 The image attached to the current user message is available now: inspect it directly.
@@ -190,10 +214,6 @@ with no substantial visible change, inspect target/focus, zoom, or change approa
 task's requirements. Do not blindly repeat or shift coordinates. Intentional repeated input
 is allowed, but explain why another identical input is needed. A changed image alone does not
 verify the goal either; inspect the visible result.
-recovery.click_guard is enforced by the controller. Withheld clicks sent no mouse input.
-Respect blocked targets; do not bypass them with shell mouse automation. Use the structured
-click tool for mouse input. After a withheld click, choose an observation, keyboard/file action
-allowed by the task, or finish with the blocker. Only the user can change the click repeat limit.
 Successful execution alone does not prove the task was completed. For GUI work, inspect the current
 image and focus/target before repeating input; old coordinates belong to their historical image.
 The task at the END of the current message
@@ -233,8 +253,8 @@ def validate_arguments(value, schema: dict, path: str) -> None:
         for child in value:
             validate_arguments(child, schema["items"], path + "[]")
     elif kind == "string":
-        if "\0" in value or len(value) > schema.get("maxLength", len(value)):
-            raise ModelError(f"{path} is too long or contains NUL bytes.")
+        if "\0" in value or not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", len(value)):
+            raise ModelError(f"{path} has an invalid length or contains NUL bytes.")
         if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
             raise ModelError(f"{path} has an invalid format.")
     elif kind in ("number", "integer"):
@@ -242,7 +262,7 @@ def validate_arguments(value, schema: dict, path: str) -> None:
             raise ModelError(f"{path} is outside the allowed range.")
 
 
-def parse_decision(content: str, task_checklist: bool = False) -> dict:
+def parse_decision(content: str, task_checklist: bool = False, review_click: bool = False) -> dict:
     content = content.strip()
     if content.startswith("```") and content.endswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -251,9 +271,12 @@ def parse_decision(content: str, task_checklist: bool = False) -> dict:
     except (ValueError, TypeError) as exc:
         raise ModelError("Model returned invalid JSON; return one schema-conforming object.") from exc
     required = set(DECISION_SCHEMA["required"])
+    if review_click:
+        required.add("click_assessment")
     optional = {"checklist_updates"} if task_checklist else set()
     if not isinstance(obj, dict) or not required <= obj.keys() or obj.keys() - required - optional:
-        raise ModelError("Decision requires exactly reason, action, arguments and state.")
+        raise ModelError("Decision requires reason, action, arguments, state" +
+                         (" and click_assessment for the last click." if review_click else "; no extra fields."))
     if not isinstance(obj["action"], str) or obj["action"] not in TOOLS:
         raise ModelError("Model selected an unknown action.")
     if obj["action"] == "set_checklist" and not task_checklist:
@@ -266,6 +289,8 @@ def parse_decision(content: str, task_checklist: bool = False) -> dict:
     validate_arguments(obj["arguments"], ARGUMENT_SCHEMAS[obj["action"]], obj["action"] + ".arguments")
     if "checklist_updates" in obj:
         validate_arguments(obj["checklist_updates"], UPDATES_SCHEMA, "checklist_updates")
+    if review_click:
+        validate_arguments(obj["click_assessment"], CLICK_ASSESSMENT_SCHEMA, "click_assessment")
     return obj
 
 
@@ -329,6 +354,8 @@ def recent_observations(events: list[dict], include_event_ids: bool = False) -> 
         if decision := data.get("decision"):
             details["action"] = decision["action"]
             details["arguments"] = compact_arguments(decision.get("arguments", {}), failed)
+            if "click_assessment" in decision:
+                details["click_assessment"] = decision["click_assessment"]
             if failed:
                 details["failed_action"] = True
                 details["recovery"] = "This attempt failed. Diagnose the error and change the approach or verify a changed precondition."
@@ -442,13 +469,11 @@ class ModelClient:
     def decide(self, task: str, state: str, memory: str, events: list[dict],
                screen: dict | None, stop: threading.Event,
                budget: dict | None = None, filesystem: dict | None = None,
-               checklist: list[dict] | None = None, recovery: dict | None = None) -> tuple[dict, dict]:
-        exclude_click = bool((recovery or {}).get("click_guard", {}).get("request_alternative"))
+               checklist: list[dict] | None = None, recovery: dict | None = None,
+               click_review_image: str | None = None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
-                          if (self.config.task_checklist or name != "set_checklist") and not (exclude_click and name == "click"))
+                          if self.config.task_checklist or name != "set_checklist")
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
-        if exclude_click:
-            prompt += "\nClick is unavailable this turn following a withheld click. Choose another allowed action.\n"
         context = {
             "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
@@ -470,14 +495,27 @@ class ModelClient:
         user = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
         if screen:
             user["images"] = [screen["base64"]]
+        review_click = bool(screen and recovery and recovery.get("click_review"))
+        messages = []
+        if review_click and click_review_image:
+            messages.append({"role": "user", "content": "Reference comparison for the last click: BEFORE on the left, "
+                             "AFTER on the right; red rings mark the actual click. These are historical crops, "
+                             "not coordinates for the next action. The following message has the current full screenshot.",
+                             "images": [click_review_image]})
+        response_shape = ('\nResponse shape: {"action":"tool name", "arguments":{tool-specific fields}, '
+                          '"reason":"short description", "state":"observed progress and next step"}')
+        if review_click:
+            response_shape = ('\nResponse shape: {"click_assessment":{"intended_effect":"observed|not_observed|uncertain", '
+                              '"evidence":"short visible observation", "next_step":"correction or justified continuation"}, '
+                              '"action":"tool name", "arguments":{tool-specific fields}, '
+                              '"reason":"short description", "state":"observed progress and next step"}')
         payload = {
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": prompt + "\nTools:\n" + tools +
-                 '\nResponse shape: {"action":"tool name", "arguments":{tool-specific fields}, '
-                 '"reason":"short description", "state":"observed progress and next step"}'}, user],
+                 response_shape}, *messages, user],
             "format": decision_schema(screen, self.config.task_checklist,
-                                      self.config.task_checklist and not checklist, exclude_click), "stream": False,
+                                      self.config.task_checklist and not checklist, review_click), "stream": False,
             "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
@@ -488,9 +526,7 @@ class ModelClient:
             raise ModelError(f"Model reached num_predict={self.config.num_predict} before completing its response. "
                              "No action was executed. Use a shorter reason/state and smaller file-writing steps.")
         try:
-            decision = parse_decision(result["message"]["content"], self.config.task_checklist)
-            if exclude_click and decision["action"] == "click":
-                raise ModelError("Click is unavailable after a withheld click; choose another allowed action.")
+            decision = parse_decision(result["message"]["content"], self.config.task_checklist, review_click)
         except (KeyError, TypeError) as exc:
             raise ModelError("Ollama returned no message content.") from exc
         metrics = {key: result[key] for key in ("total_duration", "load_duration", "prompt_eval_count",

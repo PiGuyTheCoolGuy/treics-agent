@@ -729,62 +729,6 @@ class HTTPTests(unittest.TestCase):
                                  self.cfg.dashboard_token, controls)[0], 200)
         self.assertEqual(load_config(path).stall_attempts, 0)
 
-    def test_click_controls_are_authenticated_live_saved_and_failed_changes_preserve_policy(self):
-        path = self.configure_models()
-        controls = {"X-Treic-Agent": "1"}
-        payload = {"click_repeat_limit": 7}
-        self.assertEqual(request(self.api, "/assets/click-controls.js")[0], 200)
-        self.assertEqual(request(self.api, "/api/click-guard", "POST", payload)[0], 401)
-        self.assertEqual(request(self.api, "/api/click-guard", "POST", payload, self.cfg.dashboard_token)[0], 403)
-        self.assertEqual(request(self.api, "/api/click-guard", "POST", payload, self.cfg.dashboard_token,
-                                 {**controls, "Origin": "https://attacker.example"})[0], 403)
-        status, body = request(self.api, "/api/click-guard", "POST", payload, self.cfg.dashboard_token, controls)
-        self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body), payload)
-        self.assertEqual(load_config(path), dataclasses.replace(self.cfg, click_repeat_limit=7))
-        original = path.read_bytes()
-        revision = self.agent.click_policy_version
-        for value in (None, True, -1, 1001, 1.5, "2"):
-            self.assertEqual(request(self.api, "/api/click-guard", "POST", {"click_repeat_limit": value},
-                                     self.cfg.dashboard_token, controls)[0], 400)
-        with mock.patch("treics_agent.config.os.replace", side_effect=OSError("disk error")):
-            self.assertEqual(request(self.api, "/api/click-guard", "POST", {"click_repeat_limit": 0},
-                                     self.cfg.dashboard_token, controls)[0], 400)
-        self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(self.agent.click_policy_version, revision)
-        self.assertEqual(self.agent.config.click_repeat_limit, 7)
-        self.agent.model = FakeModel([decision("screenshot", {}), decision("finish", {"summary": "Done"})])
-        self.agent.model.release.clear()
-        run_id = self.agent.start("Change click controls during inference")
-        self.assertTrue(self.agent.model.entered.wait(2))
-        try:
-            self.assertEqual(request(self.api, "/api/click-guard", "POST", {"click_repeat_limit": 0},
-                                     self.cfg.dashboard_token, controls)[0], 200)
-            self.assertEqual(self.store.run(run_id)["status"], "running")
-            self.assertEqual(self.agent.config.stall_attempts, 0)
-        finally:
-            self.agent.model.release.set()
-            self.agent.thread.join(3)
-        self.assertEqual(self.store.run(run_id)["status"], "completed")
-        self.assertEqual(load_config(path).click_repeat_limit, 0)
-        self.assertTrue(any(event["kind"] == "click_control" for event in self.store.events(run_id)))
-
-    def test_withheld_click_requires_another_action_in_schema_and_validation(self):
-        self.configure_models()
-        client = ModelClient(self.cfg)
-        recovery = {"click_guard": {"request_alternative": True}}
-        client.decide("Close the window", "", "", [], self.desktop.capture(), threading.Event(), recovery=recovery)
-        payload = self.upstream.payloads[-1]
-        actions = {case["properties"]["action"]["enum"][0] for case in payload["format"]["anyOf"]}
-        self.assertNotIn("click", actions)
-        self.assertIn("zoom_screenshot", actions)
-        self.assertIn("hotkey", actions)
-        self.assertTrue(self.proxy.inference.acquire(timeout=2))
-        self.proxy.inference.release()
-        self.upstream.decision = decision("click", {"x": 30, "y": 40})
-        with self.assertRaisesRegex(ModelError, "Click is unavailable"):
-            client.decide("Close the window", "", "", [], self.desktop.capture(), threading.Event(), recovery=recovery)
-
     def test_manual_control_can_be_applied_to_an_automatically_paused_task(self):
         path = self.configure_models()
         controls = {"X-Treic-Agent": "1"}

@@ -6,6 +6,7 @@ import json
 from collections import OrderedDict, deque
 
 from .model import compact_arguments, observation_text
+from .click_review import comparison_image
 from .progress import ProgressGuard
 from .tools import Tools
 
@@ -25,11 +26,18 @@ class RecoveryMemory:
         self.gui_attempts: deque[str] = deque(maxlen=12)
         self.gui_feedback: dict | None = None
         self._full_frame: dict | None = None
+        self.click_review: dict | None = None
+        self.click_review_image: str | None = None
+
+    def consume_click_review(self) -> None:
+        self.click_review = None
+        self.click_review_image = None
 
     def _clear_gui(self) -> None:
         self.gui_attempts.clear()
         self.gui_feedback = None
         self._full_frame = None
+        self.consume_click_review()
 
     def _gui_comparison(self, before: dict | None, after: dict | None) -> str:
         # A zoom is an observation, not a desktop change. Keep one full frame so
@@ -137,6 +145,17 @@ class RecoveryMemory:
                                                  "observation": guidance}
                 if comparison == "changed":
                     self.last_change_step = step
+                if action == "click" and after:
+                    evidence = comparison_image(before, after, effective.get("desktop_target"))
+                    self.click_review = {
+                        "step": step, "intent": observation_text(decision.get("reason", ""), 200),
+                        "arguments": arguments, "desktop_target": effective.get("desktop_target"),
+                        "screen_comparison": comparison,
+                        "before_captured_at": (before or {}).get("captured_at"),
+                        "after_captured_at": after.get("captured_at"),
+                        "reference_crop": evidence.get("desktop_region"),
+                    }
+                    self.click_review_image = evidence.get("base64")
                 return
             # Looking again or waiting must not erase evidence of previous ineffective input.
             if comparison == "changed":
@@ -174,12 +193,12 @@ class RecoveryMemory:
     def path_events(self) -> list[dict]:
         return [{"data": {"decision": {"arguments": arguments}}} for arguments in self.references.values()]
 
-    def snapshot(self, click_guard: dict | None = None) -> dict:
+    def snapshot(self) -> dict:
         context = {"failed_attempts": [], "omitted_failures": 0}
-        if click_guard is not None:
-            context["click_guard"] = copy.deepcopy(click_guard)
         if self.gui_feedback:
             context["gui_feedback"] = copy.deepcopy(self.gui_feedback)
+        if self.click_review:
+            context["click_review"] = copy.deepcopy(self.click_review)
         if self.repeated_observation and self.repeated_observation["matching_calls"] >= 2:
             context["repeated_observation"] = copy.deepcopy(self.repeated_observation)
         for item in reversed(self.failures.values()):

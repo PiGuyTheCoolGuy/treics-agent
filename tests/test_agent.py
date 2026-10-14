@@ -66,8 +66,10 @@ class FakeModel:
         self.filesystems = []
         self.checklists = []
         self.recoveries = []
+        self.click_review_images = []
 
-    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None, recovery=None):
+    def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None, recovery=None,
+               click_review_image=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)
@@ -75,6 +77,7 @@ class FakeModel:
         self.filesystems.append(filesystem)
         self.checklists.append(checklist)
         self.recoveries.append(recovery)
+        self.click_review_images.append(click_review_image)
         self.calls += 1
         self.entered.set()
         self.release.wait(5)
@@ -261,7 +264,7 @@ class AgentTests(unittest.TestCase):
         self.assertIsNotNone(model.screens[0])
         self.assertIsNone(model.screens[1])
         self.assertIsNotNone(model.screens[2])
-        self.assertEqual(self.desktop.captures, 4)  # Includes the pre-dispatch click refresh.
+        self.assertEqual(self.desktop.captures, 3)
         self.assertIn(["xdotool", "mousemove", "--sync", "960", "720"], self.desktop.commands)
 
     def test_coordinate_mapping_and_invalid_coordinates(self):
@@ -425,7 +428,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(model.recoveries[-1]["failed_attempts"][0]["failure_count"], 7)
 
     def test_manual_click_loop_reports_repeated_target_and_does_not_save_claimed_gui_success(self):
-        self.config = dataclasses.replace(self.config, history_steps=1, click_repeat_limit=0)
+        self.config = dataclasses.replace(self.config, history_steps=1)
         click = decision("click", {"x": 30, "y": 40}, "Falsely claimed window closed")
         model = self.build([
             decision("write_file", {"path": "note.txt", "content": "baseline"}, "Note file created"),

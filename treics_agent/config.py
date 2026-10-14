@@ -23,11 +23,6 @@ def validate_stall_attempts(attempts: int) -> None:
         raise ValueError("stall_attempts must be an integer from 0 to 1000; 0 means manual control")
 
 
-def validate_click_repeat_limit(limit: int) -> None:
-    if type(limit) is not int or not 0 <= limit <= 1000:
-        raise ValueError("click_repeat_limit must be an integer from 0 to 1000; 0 disables the click guard")
-
-
 @dataclasses.dataclass(frozen=True)
 class Config:
     ollama_url: str = "http://192.168.152.1:11435"
@@ -51,7 +46,6 @@ class Config:
     shell_timeout: int = 120
     history_steps: int = 6
     stall_attempts: int = 0
-    click_repeat_limit: int = 2
     task_checklist: bool = False
     browser: str = "firefox"
     bind: str = "127.0.0.1"
@@ -67,7 +61,6 @@ class Config:
             "max_steps": (1, 10000), "max_run_minutes": (1, 1440),
             "shell_timeout": (1, 600), "history_steps": (1, 20), "port": (1024, 65535),
             "stall_attempts": (0, 1000),
-            "click_repeat_limit": (0, 1000),
         }
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
@@ -109,6 +102,8 @@ def config_path() -> Path:
 def load_config(path: Path | None = None) -> Config:
     path = path or config_path()
     values = tomllib.loads(path.read_text()) if path.exists() else {}
+    # The removed click guard may have saved this key in an existing installation.
+    values.pop("click_repeat_limit", None)
     known = {field.name for field in dataclasses.fields(Config)}
     if unknown := values.keys() - known:
         raise ValueError(f"Unknown configuration fields: {', '.join(sorted(unknown))}")
@@ -146,11 +141,6 @@ def set_stall_attempts(attempts: int, path: Path | None = None) -> Path:
     return _set_setting("stall_attempts", attempts, path)
 
 
-def set_click_repeat_limit(limit: int, path: Path | None = None) -> Path:
-    validate_click_repeat_limit(limit)
-    return _set_setting("click_repeat_limit", limit, path)
-
-
 def _set_setting(name: str, value: str | int, path: Path | None) -> Path:
     path = (path or config_path()).expanduser()
     if not path.exists():
@@ -167,6 +157,7 @@ def _set_setting(name: str, value: str | int, path: Path | None) -> Path:
     values = tomllib.loads(proposed)
     if values.get(name) != value:
         raise ValueError(f"Could not update the {name} setting; configuration was not changed.")
+    values.pop("click_repeat_limit", None)
     Config(**values).validate()
     # Replace atomically: a failed write cannot truncate credentials or other settings.
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)

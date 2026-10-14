@@ -7,32 +7,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from treics_agent.config import Config, initialize_config, load_config, set_model, set_stall_attempts, set_click_repeat_limit
+from treics_agent.config import Config, initialize_config, load_config, set_model, set_stall_attempts
 from treics_agent.model import ModelClient, ModelError
 
 
 class ModelConfigTests(unittest.TestCase):
-    def test_saved_click_limit_preserves_manual_stall_control_and_other_settings(self):
+    def test_removed_click_guard_setting_does_not_break_an_existing_installation(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
             initialize_config(path)
-            original = load_config(path)
-            self.assertEqual(original.click_repeat_limit, 2)
-            path.write_text(path.read_text().replace("click_repeat_limit = 2\n", ""))
-            self.assertEqual(load_config(path).click_repeat_limit, 2)
-            set_click_repeat_limit(8, path)
-            self.assertEqual(load_config(path), dataclasses.replace(original, click_repeat_limit=8))
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            source = path.read_bytes()
-            for invalid in (None, True, -1, 1001, 1.5, "2"):
-                with self.subTest(value=invalid), self.assertRaises(ValueError):
-                    set_click_repeat_limit(invalid, path)
-            with mock.patch("treics_agent.config.os.replace", side_effect=OSError("disk error")):
-                with self.assertRaises(OSError):
-                    set_click_repeat_limit(0, path)
-            self.assertEqual(path.read_bytes(), source)
-            set_click_repeat_limit(0, path)
-            self.assertEqual(load_config(path), dataclasses.replace(original, click_repeat_limit=0))
+            initial = load_config(path)
+            path.write_text(path.read_text() + "click_repeat_limit = 2\n")
+            self.assertEqual(load_config(path), initial)
+            set_stall_attempts(0, path)
+            self.assertEqual(load_config(path).stall_attempts, 0)
 
     def test_manual_stall_default_and_saved_repeat_count_preserve_model_and_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:

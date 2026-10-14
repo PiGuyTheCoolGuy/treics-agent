@@ -8,6 +8,7 @@ The default model is **`qwen3-vl:30b-a3b-instruct`**, the quantized vision model
 
 - See the desktop, click, double-click, right-click, drag, scroll, paste Unicode text, and use keyboard shortcuts.
 - Inspect small targets with `zoom_screenshot`; clicks in the crop map back to the desktop automatically.
+- Review each click against a fresh screenshot and marked before/after close-ups, then choose a correction when the intended effect is missing.
 - See a red last-click crosshair on the live desktop/VNC and dashboard preview, with coordinates in the log.
 - Stream the desktop and mouse pointer to the dashboard while the model is thinking, paused, or idle.
 - Open Firefox, run Bash commands, read/write files, install guest software with `sudo`, and verify its work.
@@ -74,8 +75,6 @@ The desktop starts automatically even though nobody is logged into a physical di
 Only the latest screenshot is sent to the model. Terminal/file steps use text results and omit old images. The agent can request a new screenshot when it returns to GUI work. Actual latency needs to be measured on your server; this repository contains no R620 benchmark results. An 8B model is also supported if you want to compare it later.
 
 The dashboard's **Stall controls** default to **Manual Pause/Stop**. Repeated actions or errors keep retrying within your task's step/time budget. To enable automatic pausing, choose **Pause automatically**, enter 1–1,000 matching attempts, and click **Apply stall controls**. Changes are saved and apply during the current task without a restart. If it is already paused, click **Resume** separately. This replaces the fixed three-attempt pause and five-failure stop rules.
-
-The separate **Click controls** enforce a mouse-click limit in the controller. By default, two click attempts are allowed at the same desktop point/button on a visually similar scene; further attempts are withheld before mouse input. Remembered scenes also catch a popup that toggles open and closed. A fresh capture checks whether the model's image is stale before each guarded click, including crop mapping. Withheld clicks are logged as **blocked** with `action_executed=false`, appear under the desktop preview, and require another kind of action on the next model turn. They consume a step and do not automatically pause or stop the run. Set a limit of 1–1,000 or choose **Allow all clicks** and **Apply click controls**; settings apply live and persist. Apply, explicit Resume, and a new task reset click history. Raise the limit or turn it off for intentional repeated clicks. The guard covers the structured `click` tool, uses visual similarity rather than semantic goal verification, and cannot improve the model's visual judgment by itself.
 
 The model receives a small recovery memory with failed commands, working directories, errors, exit statuses, and repeat counts even when those attempts leave recent history. Fresh filesystem metadata and observed changes help it decide whether a retry makes sense. Repeated identical observations prompt it to verify progress. This improves the evidence available to the model; it cannot guarantee that the model chooses the right correction. The recovery context appears in each action's log details and does not pause or stop a run.
 

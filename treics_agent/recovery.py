@@ -174,8 +174,10 @@ class RecoveryMemory:
     def path_events(self) -> list[dict]:
         return [{"data": {"decision": {"arguments": arguments}}} for arguments in self.references.values()]
 
-    def snapshot(self) -> dict:
+    def snapshot(self, click_guard: dict | None = None) -> dict:
         context = {"failed_attempts": [], "omitted_failures": 0}
+        if click_guard is not None:
+            context["click_guard"] = copy.deepcopy(click_guard)
         if self.gui_feedback:
             context["gui_feedback"] = copy.deepcopy(self.gui_feedback)
         if self.repeated_observation and self.repeated_observation["matching_calls"] >= 2:

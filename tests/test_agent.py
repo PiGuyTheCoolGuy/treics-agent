@@ -261,7 +261,7 @@ class AgentTests(unittest.TestCase):
         self.assertIsNotNone(model.screens[0])
         self.assertIsNone(model.screens[1])
         self.assertIsNotNone(model.screens[2])
-        self.assertEqual(self.desktop.captures, 3)
+        self.assertEqual(self.desktop.captures, 4)  # Includes the pre-dispatch click refresh.
         self.assertIn(["xdotool", "mousemove", "--sync", "960", "720"], self.desktop.commands)
 
     def test_coordinate_mapping_and_invalid_coordinates(self):
@@ -425,7 +425,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(model.recoveries[-1]["failed_attempts"][0]["failure_count"], 7)
 
     def test_manual_click_loop_reports_repeated_target_and_does_not_save_claimed_gui_success(self):
-        self.config = dataclasses.replace(self.config, history_steps=1)
+        self.config = dataclasses.replace(self.config, history_steps=1, click_repeat_limit=0)
         click = decision("click", {"x": 30, "y": 40}, "Falsely claimed window closed")
         model = self.build([
             decision("write_file", {"path": "note.txt", "content": "baseline"}, "Note file created"),

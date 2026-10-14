@@ -77,9 +77,11 @@ ARGUMENT_SCHEMAS = {
 
 
 def decision_schema(screen: dict | None = None, task_checklist: bool = False,
-                    require_checklist: bool = False) -> dict:
+                    require_checklist: bool = False, exclude_click: bool = False) -> dict:
     cases = []
     for action, arguments in ARGUMENT_SCHEMAS.items():
+        if action == "click" and exclude_click:
+            continue
         if action == "set_checklist" and not task_checklist:
             continue
         if require_checklist and action not in {"set_checklist", "finish"}:
@@ -188,6 +190,10 @@ with no substantial visible change, inspect target/focus, zoom, or change approa
 task's requirements. Do not blindly repeat or shift coordinates. Intentional repeated input
 is allowed, but explain why another identical input is needed. A changed image alone does not
 verify the goal either; inspect the visible result.
+recovery.click_guard is enforced by the controller. Withheld clicks sent no mouse input.
+Respect blocked targets; do not bypass them with shell mouse automation. Use the structured
+click tool for mouse input. After a withheld click, choose an observation, keyboard/file action
+allowed by the task, or finish with the blocker. Only the user can change the click repeat limit.
 Successful execution alone does not prove the task was completed. For GUI work, inspect the current
 image and focus/target before repeating input; old coordinates belong to their historical image.
 The task at the END of the current message
@@ -437,9 +443,12 @@ class ModelClient:
                screen: dict | None, stop: threading.Event,
                budget: dict | None = None, filesystem: dict | None = None,
                checklist: list[dict] | None = None, recovery: dict | None = None) -> tuple[dict, dict]:
+        exclude_click = bool((recovery or {}).get("click_guard", {}).get("request_alternative"))
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
-                          if self.config.task_checklist or name != "set_checklist")
+                          if (self.config.task_checklist or name != "set_checklist") and not (exclude_click and name == "click"))
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
+        if exclude_click:
+            prompt += "\nClick is unavailable this turn following a withheld click. Choose another allowed action.\n"
         context = {
             "working_state": state, "persistent_notes": memory,
             "workspace": str(self.config.work_path),
@@ -468,7 +477,7 @@ class ModelClient:
                  '\nResponse shape: {"action":"tool name", "arguments":{tool-specific fields}, '
                  '"reason":"short description", "state":"observed progress and next step"}'}, user],
             "format": decision_schema(screen, self.config.task_checklist,
-                                      self.config.task_checklist and not checklist), "stream": False,
+                                      self.config.task_checklist and not checklist, exclude_click), "stream": False,
             "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
@@ -480,6 +489,8 @@ class ModelClient:
                              "No action was executed. Use a shorter reason/state and smaller file-writing steps.")
         try:
             decision = parse_decision(result["message"]["content"], self.config.task_checklist)
+            if exclude_click and decision["action"] == "click":
+                raise ModelError("Click is unavailable after a withheld click; choose another allowed action.")
         except (KeyError, TypeError) as exc:
             raise ModelError("Ollama returned no message content.") from exc
         metrics = {key: result[key] for key in ("total_duration", "load_duration", "prompt_eval_count",

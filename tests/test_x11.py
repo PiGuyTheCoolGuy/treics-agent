@@ -128,6 +128,27 @@ class X11Tests(unittest.TestCase):
                 client.sync()
                 remaining = {child.id for child in screen.root.query_tree().children}
                 self.assertTrue(marker_ids.isdisjoint(remaining))
+                # An uncooperative model cannot dispatch a third identical click.
+                from treics_agent.agent import Agent
+                from test_agent import FakeModel, decision
+                actions = [decision("click", {"x": 400, "y": 300}), decision("screenshot", {})] * 4
+                actions.append(decision("finish", {"summary": "Repeated input withheld"}))
+                agent = Agent(cfg, store, tools, FakeModel(actions))
+                try:
+                    run_id = agent.start("Repeat a click on an unchanged desktop", 20)
+                    agent.thread.join(10)
+                    self.assertFalse(agent.thread.is_alive())
+                    self.assertEqual(store.run(run_id)["status"], "completed")
+                    client.sync()
+                    presses = []
+                    while client.pending_events():
+                        event = client.next_event()
+                        if event.type == X.ButtonPress:
+                            presses.append(event)
+                    self.assertEqual(len(presses), 2, "A withheld click reached the real X11 window")
+                    self.assertEqual(len([e for e in store.events(run_id) if e["kind"] == "blocked"]), 2)
+                finally:
+                    agent.shutdown()
                 # Live capture is independent of the model's cached image and GUI lock.
                 saved_frame, saved_preview = desktop.frame, desktop.image
                 live = DesktopStream(cfg)

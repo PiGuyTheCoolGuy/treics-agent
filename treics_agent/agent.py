@@ -7,8 +7,10 @@ import threading
 import time
 from pathlib import Path
 
-from .config import Config, config_path, set_model, set_stall_attempts, validate_model_name, validate_stall_attempts
+from .config import (Config, config_path, set_model, set_stall_attempts, set_click_repeat_limit,
+                     validate_model_name, validate_stall_attempts, validate_click_repeat_limit)
 from .checklist import Checklist
+from .click_guard import ClickGuard
 from .model import Cancelled, ModelClient, ModelError, observation_text
 from .progress import ProgressGuard
 from .recovery import RecoveryMemory
@@ -38,6 +40,9 @@ class Agent:
         self.model_switching = False
         self.stall_setting_saving = False
         self.stall_policy_version = 0
+        self.click_policy_version = 0
+        self.resume_version = 0
+        self.last_click_block: dict | None = None
         self.phase = "idle"
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
@@ -59,6 +64,7 @@ class Agent:
                     "workspace": str(self.config.work_path), "runs": self.store.runs(),
                     "previewing": self.previewing, "model_switching": self.model_switching,
                     "stall_attempts": self.config.stall_attempts, "stall_setting_saving": self.stall_setting_saving,
+                    "click_repeat_limit": self.config.click_repeat_limit, "last_click_block": self.last_click_block,
                     "task_active": bool(self.thread and self.thread.is_alive())}
         # Never hold the control lock while consulting desktop state.
         return {**result, **self.tools.desktop.snapshot()}
@@ -128,6 +134,28 @@ class Agent:
             with self.lock:
                 self.stall_setting_saving = False
 
+    def set_click_control(self, limit: int) -> dict:
+        validate_click_repeat_limit(limit)
+        with self.lock:
+            if self.model_switching or self.stall_setting_saving:
+                raise ValueError("A settings change is already in progress. Try again shortly.")
+            self.stall_setting_saving = True
+        try:
+            set_click_repeat_limit(limit, self.config_file)
+            with self.lock:
+                self.config = dataclasses.replace(self.config, click_repeat_limit=limit)
+                self.click_policy_version += 1
+                self.last_click_block = None
+                if self.thread and self.thread.is_alive():
+                    self.store.event(self.current, self.store.run(self.current)["step"], "click_control", {
+                        "click_repeat_limit": limit,
+                        "message": (f"User set click guard to {limit} matching attempts per desktop scene."
+                                    if limit else "User disabled the click guard.")})
+            return {"click_repeat_limit": limit}
+        finally:
+            with self.lock:
+                self.stall_setting_saving = False
+
     def start(self, task: str, max_steps: int | None = None) -> str:
         if not isinstance(task, str) or not task.strip() or len(task) > 12000:
             raise ValueError("Task must contain 1–12000 characters.")
@@ -144,6 +172,7 @@ class Agent:
             self.stop_event.clear()
             self.paused = False
             self.pause_reason = None
+            self.last_click_block = None
             self.current = self.store.create_run(task.strip(), max_steps, self.config.model, self.config.task_checklist)
             self.tools.run_id = self.current
             self.tools.desktop.run_directory = self.config.data_path / "runs" / self.current
@@ -166,6 +195,9 @@ class Agent:
             if not self.paused or not self.thread or not self.thread.is_alive() or self.stop_event.is_set():
                 raise ValueError("No paused task to resume.")
             self.paused = False
+            self.resume_version += 1
+            self.click_policy_version += 1  # Explicit Resume grants a fresh click-attempt window.
+            self.last_click_block = None
             if self.pause_reason:
                 self.store.event(self.current, self.store.run(self.current)["step"], "resumed",
                                  {"message": "Resumed after a detected loop. Choose a different approach "
@@ -223,6 +255,52 @@ class Agent:
             attempts, revision = self.config.stall_attempts, self.stall_policy_version
         progress.configure(attempts, revision)
 
+    def _configure_click_guard(self, guard: ClickGuard) -> None:
+        with self.lock:
+            limit, revision = self.config.click_repeat_limit, self.click_policy_version
+        guard.configure(limit, revision)
+
+    def _prepare_click(self, decision: dict, screen: dict | None, guard: ClickGuard,
+                       step: int, deadline: float) -> tuple[dict | None, dict | None, tuple | None, dict | None]:
+        self._configure_click_guard(guard)
+        if not guard.limit:
+            return None, screen, None, None
+        desktop = self.tools.desktop
+        if not screen:
+            raise ToolError("No current screenshot. Use screenshot before a click.")
+        x, y = desktop.coordinates(decision["arguments"]["x"], decision["arguments"]["y"])
+        target = (x, y, decision["arguments"].get("button", "left"))
+        if guard.alternative_required:
+            return guard.reject("alternative_required", target, step), screen, None, None
+        while True:
+            with self.lock:
+                resumed = self.resume_version
+            self._gate(deadline)
+            self.set_phase("observing")
+            with desktop.lock:
+                full = desktop.capture()
+                fresh = full
+                if screen.get("view") == "zoom":
+                    if any(screen[name] != full[name] for name in ("desktop_width", "desktop_height")):
+                        return guard.reject("stale_image", target, step), full, None, None
+                    region = {**screen["source"], "scale": screen["zoom_scale"],
+                              "desktop_width": screen["desktop_width"], "desktop_height": screen["desktop_height"]}
+                    fresh = desktop.capture(region)
+            self._gate(deadline)  # Stop/pause during capture must gate the mouse input.
+            with self.lock:
+                if resumed != self.resume_version:
+                    continue
+            self._configure_click_guard(guard)
+            if not guard.limit:
+                return None, fresh, None, None
+            if not ClickGuard.same_scene(screen, fresh):
+                return guard.reject("stale_image", target, step), fresh, None, None
+            blocked = guard.assess(target, full, step)
+            with self.lock:
+                if (guard.limit, guard.revision) != (self.config.click_repeat_limit, self.click_policy_version):
+                    continue
+            return blocked, fresh, target, full
+
     def _pause_stalled(self, run_id: str, step: int, reason: str, deadline: float,
                        attempts: int, revision: int) -> bool:
         with self.condition:
@@ -247,6 +325,8 @@ class Agent:
         screen = None
         progress = ProgressGuard(self.config.stall_attempts, self.stall_policy_version)
         recovery = RecoveryMemory()
+        click_guard = ClickGuard(self.config.click_repeat_limit, self.click_policy_version)
+        resume_version = self.resume_version
         checklist = Checklist(self.store, run_id, self.config.work_path) if run["task_checklist"] else None
         try:
             self._gate(deadline)
@@ -254,12 +334,19 @@ class Agent:
             screen = self.tools.desktop.capture()
             for step in range(1, run["max_steps"] + 1):
                 self._gate(deadline)
+                with self.lock:
+                    resumed = self.resume_version
+                if resumed != resume_version:
+                    self.set_phase("observing")
+                    screen = self.tools.desktop.capture()
+                    resume_version = resumed
                 self.store.update(run_id, step=step)
                 self.set_phase("model")
                 started = time.monotonic()
                 decision = None
                 action_dispatched = False
-                recovery_context = recovery.snapshot()
+                self._configure_click_guard(click_guard)
+                recovery_context = recovery.snapshot(click_guard.snapshot())
                 try:
                     context_events = self._context_events(run_id)
                     checklist_context = {"checklist": checklist.snapshot()} if checklist else {}
@@ -274,6 +361,20 @@ class Agent:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
                     self._gate(deadline)
+                    click_target = click_frame = None
+                    if decision["action"] == "click":
+                        blocked, screen, click_target, click_frame = self._prepare_click(
+                            decision, screen, click_guard, step, deadline)
+                        if blocked:
+                            with self.lock:
+                                self.last_click_block = blocked
+                            self.store.event(run_id, step, "blocked", {
+                                "decision": decision, "action_executed": False, "message": blocked["message"],
+                                "result": {"ok": False, "skipped": True, "input_sent": False,
+                                           "blocked_by": "click_guard", **blocked},
+                                "recovery_context": recovery_context,
+                                "model_seconds": self.last_model_seconds, "metrics": metrics})
+                            continue  # Ask for another action; do not pause/stop or dispatch mouse input.
                     if checklist:
                         if not checklist.snapshot() and decision["action"] not in {"set_checklist", "finish"}:
                             raise ModelError("Create the checklist with set_checklist before starting task tools.")
@@ -285,6 +386,12 @@ class Agent:
                     self.store.event(run_id, step, "action_started", {"decision": decision})
                     action_dispatched = True
                     result = self.tools.execute(decision["action"], decision["arguments"], self.stop_event)
+                    if click_target and result.get("ok"):
+                        click_guard.record(click_target, click_frame)
+                        with self.lock:
+                            self.last_click_block = None
+                    if result.get("ok"):
+                        click_guard.observe_action(decision["action"])
                     if decision["action"] in self.tools.INPUT_ACTIONS:
                         result["state_saved"] = False
                     elif result.get("ok", False) and not result.get("skipped", False):

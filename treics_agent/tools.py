@@ -191,6 +191,8 @@ class Desktop:
                          "desktop_width": screen_width, "desktop_height": screen_height,
                          "view": "zoom" if region else "desktop", "source": source,
                          "captured_at": time.time(), "base64": base64.b64encode(self.jpeg(view)).decode()}
+                if region:
+                    frame["zoom_scale"] = region["scale"]
                 with self.state_lock:
                     self.image = preview
                     self.frame = frame

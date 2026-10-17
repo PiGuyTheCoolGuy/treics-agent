@@ -42,12 +42,31 @@ class Agent:
         self.phase = "idle"
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
+        self.model_output = {"run_id": None, "step": 0, "status": "idle",
+                             "text": "", "sequence": 0}
         self.store.recover()
 
     def set_phase(self, phase: str) -> None:
         with self.lock:
             self.phase = phase
             self.phase_started = time.time()
+
+    def update_model_output(self, run_id: str, step: int, status: str, chunk: str = "") -> None:
+        # The running inference thread owns this state; dashboards subscribe without
+        # influencing model execution. Only the latest response is retained in memory.
+        with self.condition:
+            if self.model_output["run_id"] != run_id or self.model_output["step"] != step:
+                self.model_output = {"run_id": run_id, "step": step, "status": status,
+                                     "text": "", "sequence": self.model_output["sequence"] + 1}
+            if chunk:
+                self.model_output["text"] = (self.model_output["text"] + chunk)[-100000:]
+            self.model_output["status"] = status
+            self.model_output["sequence"] += 1
+            self.condition.notify_all()
+
+    def model_output_snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.model_output)
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -146,6 +165,7 @@ class Agent:
             self.paused = False
             self.pause_reason = None
             self.current = self.store.create_run(task.strip(), max_steps, self.config.model, self.config.task_checklist)
+            self.update_model_output(self.current, 0, "waiting")
             self.tools.run_id = self.current
             self.tools.desktop.run_directory = self.config.data_path / "runs" / self.current
             self.set_phase("starting")
@@ -270,6 +290,7 @@ class Agent:
                         full_screen = screen
                         refresh_after_click_error = False
                     self.set_phase("model")
+                    self.update_model_output(run_id, step, "generating")
                     started = time.monotonic()
                     context_events = self._context_events(run_id)
                     checklist_context = {"checklist": checklist.snapshot()} if checklist else {}
@@ -281,7 +302,9 @@ class Agent:
                         budget={"current_step": step, "max_steps": run["max_steps"],
                                 "steps_remaining": run["max_steps"] - step + 1},
                         filesystem=self.tools.filesystem_context(recovery.path_events() + context_events),
-                        recovery=recovery_context, **checklist_context, **review_context)
+                        recovery=recovery_context, **checklist_context, **review_context,
+                        on_chunk=lambda chunk: self.update_model_output(run_id, step, "generating", chunk))
+                    self.update_model_output(run_id, step, "complete")
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
                     # A pause/stop that arrived during inference must gate the proposed action.
@@ -399,6 +422,7 @@ class Agent:
                         raise Cancelled()
             self.store.update(run_id, status="limit_reached", summary="Step limit reached. Inspect the log and start a follow-up task.")
         except Cancelled:
+            self.update_model_output(run_id, self.model_output_snapshot()["step"], "stopped")
             self.store.update(run_id, status="stopped", summary="Stopped by user. No further actions will execute.")
         except TimeoutError as exc:
             self.store.update(run_id, status="limit_reached", summary=str(exc))
@@ -409,6 +433,11 @@ class Agent:
                 self.store.event(run_id, self.store.run(run_id)["step"], "error", {"message": str(exc)[:2000]})
                 self.store.update(run_id, status="failed", summary=str(exc)[:2000])
         finally:
+            with self.condition:
+                if self.model_output["run_id"] == run_id and self.model_output["status"] == "generating":
+                    self.model_output["status"] = "interrupted"
+                    self.model_output["sequence"] += 1
+                    self.condition.notify_all()
             with self.lock:
                 self.pause_reason = None
                 self.paused = False

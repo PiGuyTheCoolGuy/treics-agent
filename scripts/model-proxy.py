@@ -82,7 +82,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 options["temperature"] = temperature
                 payload["options"] = options
                 payload["keep_alive"] = "30m"
-                payload["stream"] = False
+                payload["stream"] = payload.get("stream") is True
                 if not self.server.inference.acquire(blocking=False):
                     return self.respond(429, {"error": "A model request is still active; retry shortly"})
         except (ValueError, OSError) as exc:
@@ -119,6 +119,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.request(method, self.path, json.dumps(payload) if method == "POST" else None,
                          {"Content-Type": "application/json"})
             response = conn.getresponse()
+            if is_chat and payload["stream"] and response.status == 200:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                total = 0
+                while not disconnected.is_set():
+                    line = response.readline(4 * 1024 * 1024 + 1)
+                    if not line:
+                        break
+                    total += len(line)
+                    if total > 4 * 1024 * 1024:
+                        break
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                return
             data = response.read(4 * 1024 * 1024 + 1)
             if len(data) > 4 * 1024 * 1024:
                 raise ValueError("Upstream response exceeds 4 MiB")

@@ -113,12 +113,40 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stream.unsubscribe()
 
+    def stream_model_output(self) -> None:
+        agent = self.server.agent
+        self.connection.settimeout(12)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.close_connection = True
+        sequence = -1
+        try:
+            while True:
+                with agent.condition:
+                    agent.condition.wait_for(
+                        lambda: agent.model_output["sequence"] != sequence, timeout=10)
+                    state = dict(agent.model_output)
+                if state["sequence"] != sequence:
+                    sequence = state["sequence"]
+                    payload = json.dumps(state, ensure_ascii=False)
+                    self.wfile.write(("data: " + payload + "\n\n").encode())
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+        except (OSError, TimeoutError):
+            pass
+
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/":
             self.send(200, files("treics_agent").joinpath("static/index.html").read_bytes(), "text/html; charset=utf-8")
             return
-        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js", "/assets/stall-controls.js"):
+        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js", "/assets/stall-controls.js", "/assets/model-output.js"):
             self.send(200, files("treics_agent").joinpath("static", path.rsplit("/", 1)[1]).read_bytes(),
                       "application/javascript; charset=utf-8")
             return
@@ -134,6 +162,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(502, {"error": str(exc)[:1500]})
         elif path == "/api/desktop/stream":
             self.stream_desktop()
+        elif path == "/api/model/output/stream":
+            self.stream_model_output()
         elif match := re.fullmatch(r"/api/runs/([a-f0-9]{32})", path):
             run_id = match.group(1)
             run = agent.store.run(run_id)

@@ -131,6 +131,27 @@ Optional progress updates can accompany an ordinary action, avoiding a separate 
 
 For comparison, keep the original prompt, model options, starting files and step budget the same. Use separate output folders for each trial. The extra planning step and bounded checklist context are part of the experiment; disabling the mode removes its tools, progress fields and instructions from model requests. This feature is a planning aid, not an approval gate or a security boundary.
 
+### Live model output upgrade (existing installation)
+
+The dashboard's **Live model output** panel displays the latest structured model response while Ollama produces it. Streaming requires both updated components: the host gateway must forward Ollama's NDJSON stream, and the guest controller must display it through its authenticated dashboard endpoint. Updating only the VM is insufficient.
+
+After merging the streaming changes to `main`, run **on the host** (from your checkout):
+
+```bash
+cd ~/treics-agent
+git pull --ff-only
+sudo install -m 644 scripts/model-proxy.py /opt/treics-agent-host/model-proxy.py
+sudo systemctl restart treic-model-proxy
+```
+
+Then update and restart the **guest controller** from the host:
+
+```bash
+bash scripts/ssh-vm.sh 'cd ~/treics-agent && git pull --ff-only && bash scripts/install-guest.sh --skip-apt && systemctl --user restart treics-agent'
+```
+
+Refresh the dashboard and start a new task. Its live output pane should show incremental response text for the selected run, switching to **complete** after Ollama returns the final message and the agent validates the decision. Your task history and Stop/Pause controls remain independent of the streaming connection. The panel shows only model output provided by Ollama, not hidden reasoning. Unlike the desktop preview, this stream contains text, so treat the dashboard token as sensitive.
+
 ## 5. Stop, restart, update, and keep a baseline
 
 **Dashboard Stop** prevents the next action, cancels the model request, and kills the current shell process group. Pause waits for the current tool to return before stopping at the next action boundary. Stop does not undo earlier changes or kill background processes intentionally detached by previous commands.

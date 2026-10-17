@@ -146,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send(200, files("treics_agent").joinpath("static/index.html").read_bytes(), "text/html; charset=utf-8")
             return
-        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js", "/assets/stall-controls.js"):
+        if path in ("/assets/desktop-stream.js", "/assets/model-selector.js", "/assets/stall-controls.js", "/assets/model-output.js"):
             self.send(200, files("treics_agent").joinpath("static", path.rsplit("/", 1)[1]).read_bytes(),
                       "application/javascript; charset=utf-8")
             return

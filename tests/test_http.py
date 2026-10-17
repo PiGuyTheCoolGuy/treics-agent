@@ -80,6 +80,26 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.server.payloads.append(payload)
         if self.path == "/api/show":
             return self.reply({"capabilities": self.server.capabilities.get(payload["model"], ["completion", "vision"])})
+        if self.path == "/api/chat" and payload.get("stream"):
+            output = json.dumps(self.server.decision)
+            pieces = [output[:len(output) // 2], output[len(output) // 2:]]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            if self.server.block and (self.server.block_paths is None or self.path in self.server.block_paths):
+                self.server.entered.set()
+                self.server.release.wait(5)
+            for index, piece in enumerate(pieces):
+                data = {"message": {"role": "assistant", "content": piece},
+                        "done": index == len(pieces) - 1}
+                if data["done"]:
+                    data.update({"eval_count": 20, **self.server.reply_overrides})
+                try:
+                    self.wfile.write((json.dumps(data) + "\n").encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+            return
         self.reply({"message": {"role": "assistant", "content": json.dumps(self.server.decision)},
                     "done": True, "total_duration": 1000000000, "eval_count": 20, **self.server.reply_overrides})
 
@@ -152,6 +172,38 @@ class HTTPTests(unittest.TestCase):
         status, body = request(self.api, "/api/runs/" + run_id, token=self.cfg.dashboard_token)
         self.assertEqual(json.loads(body)["run"]["status"], "completed")
         self.assertEqual(request(self.api, "/api/screen", token=self.cfg.dashboard_token)[0], 200)
+
+    def test_authenticated_live_model_output_stream(self):
+        self.assertEqual(request(self.api, "/api/model/output/stream")[0], 401)
+        self.assertEqual(request(self.api, "/api/model/output/stream", token=self.cfg.dashboard_token,
+                                 extra={"Origin": "https://attacker.example"})[0], 403)
+        connection = http.client.HTTPConnection(*self.api.server_address, timeout=2)
+        connection.request("GET", "/api/model/output/stream",
+                           headers={"Authorization": "Bearer " + self.cfg.dashboard_token})
+        response = connection.getresponse()
+        try:
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/event-stream", response.getheader("Content-Type"))
+            first = response.readline()
+            self.assertTrue(first.startswith(b"data: "))
+            self.agent.update_model_output("a" * 32, 2, "generating", "partial response")
+            response.readline()  # End of initial event.
+            state = json.loads(response.readline()[6:])
+            self.assertEqual(state["text"], "partial response")
+            self.assertEqual(state["step"], 2)
+        finally:
+            connection.close()
+
+    def test_model_stream_round_trip_through_gateway(self):
+        self.configure_models()
+        chunks = []
+        client = ModelClient(self.cfg)
+        result, metrics = client.decide("Stream decision", "", "", [], None,
+                                         threading.Event(), on_chunk=chunks.append)
+        self.assertEqual(result["action"], "finish")
+        self.assertEqual("".join(chunks), json.dumps(self.upstream.decision))
+        self.assertEqual(metrics["eval_count"], 20)
+        self.assertIs(self.upstream.payloads[-1]["stream"], True)
 
     def configure_models(self):
         self.cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,

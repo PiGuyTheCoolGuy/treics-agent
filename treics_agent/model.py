@@ -431,7 +431,8 @@ class ModelClient:
                 conn.close()
 
     def request(self, method: str, path: str, payload: dict | None = None,
-                stop: threading.Event | None = None, timeout: float | None = None) -> dict:
+                stop: threading.Event | None = None, timeout: float | None = None,
+                on_chunk=None) -> dict:
         url = urlsplit(self.config.ollama_url)
         cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
         conn = cls(url.hostname, url.port, timeout=min(10, timeout) if timeout is not None else 10)
@@ -453,6 +454,44 @@ class ModelClient:
             conn.request(method, path, body=json.dumps(payload) if payload is not None else None,
                          headers=headers)
             response = conn.getresponse()
+            if on_chunk is not None and response.status == 200:
+                # Ollama streams newline-delimited JSON, not one JSON document.
+                parts = []
+                total = 0
+                final = None
+                while True:
+                    if stop and stop.is_set():
+                        raise Cancelled()
+                    line = response.readline(4 * 1024 * 1024 + 1)
+                    if not line:
+                        break
+                    total += len(line)
+                    if total > 4 * 1024 * 1024:
+                        raise ModelError("Model response exceeded 4 MiB.")
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise ModelError("Invalid Ollama stream response.")
+                    if item.get("error"):
+                        raise ModelError(str(item["error"]))
+                    message = item.get("message") or {}
+                    if isinstance(message, dict):
+                        fragment = message.get("content", "")
+                        if not isinstance(fragment, str):
+                            raise ModelError("Invalid model output chunk.")
+                        if fragment:
+                            parts.append(fragment)
+                            on_chunk(fragment)
+                    if item.get("done"):
+                        final = item
+                        break
+                if stop and stop.is_set():
+                    raise Cancelled()
+                if final is None:
+                    raise ModelError("Ollama stream ended without a completion marker.")
+                final["message"] = {"role": "assistant", "content": "".join(parts)}
+                return final
             data = response.read(4 * 1024 * 1024 + 1)
             if len(data) > 4 * 1024 * 1024:
                 raise ModelError("Model response exceeded 4 MiB.")
@@ -507,7 +546,7 @@ class ModelClient:
                screen: dict | None, stop: threading.Event,
                budget: dict | None = None, filesystem: dict | None = None,
                checklist: list[dict] | None = None, recovery: dict | None = None,
-               click_review_image: str | None = None) -> tuple[dict, dict]:
+               click_review_image: str | None = None, on_chunk=None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
                           if self.config.task_checklist or name != "set_checklist")
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
@@ -567,13 +606,14 @@ class ModelClient:
                 {"role": "system", "content": prompt + "\nTools:\n" + tools +
                  response_shape}, *messages, user],
             "format": decision_schema(screen, self.config.task_checklist,
-                                      self.config.task_checklist and not checklist, review_click, space), "stream": False,
+                                      self.config.task_checklist and not checklist, review_click, space), "stream": on_chunk is not None,
             "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
                         "num_thread": self.config.num_thread, "num_predict": self.config.num_predict},
         }
-        result = self.request("POST", "/api/chat", payload, stop)
+        result = (self.request("POST", "/api/chat", payload, stop, on_chunk=on_chunk) if on_chunk
+                  else self.request("POST", "/api/chat", payload, stop))
         if result.get("done_reason") == "length":
             raise ModelError(f"Model reached num_predict={self.config.num_predict} before completing its response. "
                              "No action was executed. Use a shorter reason/state and smaller file-writing steps.")

@@ -164,6 +164,48 @@ const selector=new context.ModelSelector(async(path)=>{
         result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_live_model_output_reports_first_token_thinking_and_transport_errors(self):
+        script = r'''
+const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
+const elements = new Map();
+function element(id) {
+  if (!elements.has(id)) elements.set(id, {
+    textContent: '', checked: true, scrollTop: 0, scrollHeight: 0, clientHeight: 300,
+    addEventListener() {}
+  });
+  return elements.get(id);
+}
+const context = vm.createContext({
+  document: {getElementById: element, addEventListener(){}, hidden: false},
+  window: {addEventListener(){}}, navigator: {clipboard: {writeText(){}}},
+  Date, setTimeout, clearTimeout, setInterval, clearInterval, AbortController, TextDecoder,
+});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const viewer = new context.ModelOutputView(() => 'token', () => 'run1');
+viewer.connected = true;
+viewer.state = {run_id:'run1', step:1, status:'generating', text:'', thinking:'',
+  chunks:0, thinking_chunks:0, started_at: Date.now()/1000-25};
+viewer.showSelected();
+assert.match(element('modelOutput').textContent, /Waiting for first token/);
+assert.match(element('modelOutputStatus').textContent, /25s elapsed/);
+viewer.state.thinking = 'Visible thoughts'; viewer.state.thinking_chunks = 1;
+viewer.state.status = 'thinking';
+viewer.showSelected();
+assert.match(element('modelOutput').textContent, /Visible thoughts/);
+viewer.state.text = '{"action": "finish"}'; viewer.state.chunks = 1; viewer.state.status = 'streaming';
+viewer.showSelected();
+assert.match(element('modelOutput').textContent, /"action": "finish"/);
+assert.match(element('modelOutputStatus').textContent, /Receiving text/);
+viewer.state = {run_id:'run1', step:1, status:'error', text:'', thinking:'', error:'Gateway not streaming'};
+viewer.showSelected();
+assert.match(element('modelOutput').textContent, /Gateway not streaming/);
+assert.match(element('modelOutputStatus').textContent, /Error/);
+'''
+        path = Path(__file__).resolve().parents[1] / "treics_agent/static/model-output.js"
+        result = subprocess.run(["node", "-e", script, str(path)],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_live_stream_reconnects_after_disconnect_and_cancels_cleanly(self):
         script = r'''
 const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');

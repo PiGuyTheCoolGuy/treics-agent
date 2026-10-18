@@ -16,7 +16,7 @@ from PIL import Image
 
 from treics_agent.agent import Agent
 from treics_agent.config import Config, initialize_config, load_config
-from treics_agent.model import ARGUMENT_SCHEMAS, ModelError, decision_schema, parse_decision
+from treics_agent.model import ARGUMENT_SCHEMAS, ModelError, ModelOutputExhausted, decision_schema, parse_decision
 from treics_agent.progress import ProgressGuard
 from treics_agent.storage import Store
 from treics_agent.tools import Desktop, ToolError, Tools
@@ -417,6 +417,22 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(run["status"], "completed")
         self.assertEqual(model.calls, 8)
         self.assertFalse(any(event["kind"] == "stalled" for event in self.store.events(run["id"])))
+
+    def test_unlimited_output_exhaustion_stops_without_repeated_model_calls(self):
+        model = self.build([
+            decision("write_file", {"path": "existing.txt", "content": "keep"} , "Saved work"),
+            ModelOutputExhausted("Ollama ended generation with done_reason=length at num_predict=-1. "
+                                 "No action was executed. Output tokens are already unlimited."),
+            decision("finish", {"summary": "Should not run"}),
+        ])
+        run = self.complete(max_steps=20)
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(model.calls, 2)
+        self.assertEqual((self.config.work_path / "existing.txt").read_text(), "keep")
+        self.assertIn("already unlimited", run["summary"])
+        events = self.store.events(run["id"])
+        self.assertEqual(len([event for event in events if event["kind"] == "error"]), 1)
+        self.assertFalse(any(event["kind"] == "stalled" for event in events))
 
     def test_manual_mode_retries_more_than_five_model_failures(self):
         model = self.build([ModelError("Output limit reached")] * 7 + [decision("finish", {"summary": "Recovered"})])

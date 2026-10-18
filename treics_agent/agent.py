@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import Config, config_path, set_model, set_stall_attempts, validate_model_name, validate_stall_attempts
 from .checklist import Checklist
 from .click_review import inspection_region, marked_image
-from .model import Cancelled, ModelClient, ModelError, observation_text
+from .model import Cancelled, ModelClient, ModelError, ModelOutputExhausted, observation_text
 from .progress import ProgressGuard
 from .recovery import RecoveryMemory
 from .storage import Store
@@ -419,6 +419,11 @@ class Agent:
                             error_data["message"] = "Decision rejected before tool execution: " + message
                     event_id = self.store.event(run_id, step, "error", error_data)
                     recovery.failure(decision, step, message, action_executed=error_data.get("action_executed"))
+                    if isinstance(exc, ModelOutputExhausted):
+                        # Replaying the same context and prompt consumes steps without
+                        # changing the condition. Preserve the error and stop this run.
+                        self.store.update(run_id, status="failed", summary=message)
+                        return
                     if checklist and checklist.observe({"id": event_id, "kind": "error", "data": error_data}):
                         self.store.event(run_id, step, "checklist_updated",
                                          {"items": checklist.snapshot(), "message": "Recorded unsuccessful attempt."})

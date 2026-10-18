@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 
 from .agent import Agent
-from .config import Config, config_path, initialize_config, load_config, set_task_checklist
+from .config import Config, config_path, initialize_config, load_config, set_task_checklist, set_output_tokens
 from .model import ModelClient
 from .server import AgentHTTPServer
 from .storage import Store
@@ -99,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("memory", help="print saved cross-run notes")
     checklist_parser = commands.add_parser("checklist", help="enable/disable the optional task checklist")
     checklist_parser.add_argument("mode", choices=("on", "off"))
+    output_parser = commands.add_parser("output-tokens", help="set maximum output tokens per model call; -1 = unlimited")
+    output_parser.add_argument("count", type=int)
     args = parser.parse_args(argv)
     try:
         if args.config:
@@ -109,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "checklist":
             path = set_task_checklist(args.mode == "on", args.config)
             print(f"Task checklist {args.mode}: {path}. Restart the controller to apply.")
+            return 0
+        if args.command == "output-tokens":
+            path = set_output_tokens(args.count, args.config)
+            print(f"Output token limit: {args.count} ({'unlimited' if args.count == -1 else 'tokens'}) in {path}. Restart the controller to apply.")
             return 0
         cfg = load_config(args.config)
         if args.command == "token":

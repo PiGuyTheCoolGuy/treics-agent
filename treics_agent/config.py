@@ -31,7 +31,7 @@ class Config:
     coordinate_space: str = "auto"
     num_thread: int = 16
     num_ctx: int = 8192
-    num_predict: int = 1600
+    num_predict: int = 8192
     keep_alive: str = "30m"
     request_timeout: int = 1200
     display: str = ":99"
@@ -56,7 +56,7 @@ class Config:
     def validate(self) -> None:
         integer_ranges = {
             "num_thread": (1, 256), "num_ctx": (4096, 65536),
-            "num_predict": (128, 8192), "request_timeout": (10, 3600),
+            "request_timeout": (10, 3600),
             "screen_width": (320, 1920), "screen_height": (240, 1200),
             "stream_fps": (1, 15), "stream_quality": (30, 95),
             "max_steps": (1, 10000), "max_run_minutes": (1, 1440),
@@ -65,7 +65,10 @@ class Config:
         }
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            if field.name == "task_checklist":
+            if field.name == "num_predict":
+                if type(value) is not int or (value != -1 and not 128 <= value <= 32768):
+                    raise ValueError("num_predict must be -1 (unlimited) or 128–32768")
+            elif field.name == "task_checklist":
                 if type(value) is not bool:
                     raise ValueError("task_checklist must be true or false")
             elif field.name in integer_ranges:
@@ -137,6 +140,12 @@ def set_model(model: str, path: Path | None = None) -> Path:
     if "TREICS_AGENT_MODEL" in os.environ and os.environ["TREICS_AGENT_MODEL"] != model:
         raise ValueError("TREICS_AGENT_MODEL fixes the model. Remove that environment override and restart before switching.")
     return _set_setting("model", model, path)
+
+
+def set_output_tokens(tokens: int, path: Path | None = None) -> Path:
+    if type(tokens) is not int or (tokens != -1 and not 128 <= tokens <= 32768):
+        raise ValueError("num_predict must be -1 (unlimited) or 128–32768")
+    return _set_setting("num_predict", tokens, path)
 
 
 def set_stall_attempts(attempts: int, path: Path | None = None) -> Path:

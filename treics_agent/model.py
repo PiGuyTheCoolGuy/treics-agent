@@ -471,8 +471,8 @@ class ModelClient:
                     if not line:
                         break
                     total += len(line)
-                    if total > 4 * 1024 * 1024:
-                        raise ModelError("Model response exceeded 4 MiB.")
+                    if total > 64 * 1024 * 1024:
+                        raise ModelError("Model response exceeded the 64 MiB safety limit.")
                     if not line.strip():
                         continue
                     item = json.loads(line)
@@ -627,8 +627,8 @@ class ModelClient:
                                on_thinking=on_thinking) if payload["stream"]
                   else self.request("POST", "/api/chat", payload, stop))
         if result.get("done_reason") == "length":
-            raise ModelError(f"Model reached num_predict={self.config.num_predict} before completing its response. "
-                             "No action was executed. Use a shorter reason/state and smaller file-writing steps.")
+            raise ModelError(f"Model output was truncated at num_predict={self.config.num_predict}. "
+                             "No action was executed. Increase output-tokens or use shorter model responses.")
         try:
             decision = parse_decision(result["message"]["content"], self.config.task_checklist, review_click)
         except (KeyError, TypeError) as exc:

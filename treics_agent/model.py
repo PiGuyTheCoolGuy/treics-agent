@@ -249,6 +249,11 @@ class ModelError(Exception):
     pass
 
 
+class ModelOutputExhausted(ModelError):
+    """Ollama stopped generation for length; blindly retrying cannot fix this."""
+    pass
+
+
 def validate_arguments(value, schema: dict, path: str) -> None:
     """Validate the subset of JSON Schema used by our action definitions."""
     kind = schema.get("type")
@@ -627,8 +632,23 @@ class ModelClient:
                                on_thinking=on_thinking) if payload["stream"]
                   else self.request("POST", "/api/chat", payload, stop))
         if result.get("done_reason") == "length":
-            raise ModelError(f"Model output was truncated at num_predict={self.config.num_predict}. "
-                             "No action was executed. Increase output-tokens or use shorter model responses.")
+            generated = result.get("eval_count")
+            prompted = result.get("prompt_eval_count")
+            metrics = (f" Ollama generated {generated} tokens; prompt evaluation used {prompted} tokens."
+                       if isinstance(generated, int) and isinstance(prompted, int) else
+                       f" Ollama generated {generated} tokens." if isinstance(generated, int) else "")
+            if self.config.num_predict == -1:
+                guidance = ("Output tokens are already unlimited. The model may have exhausted its "
+                            "context/generation capacity or entered a reasoning loop. "
+                            "Reduce context/history, choose a model that reliably completes JSON, "
+                            "or try a finite output budget. Do not retry this same request unchanged.")
+            else:
+                guidance = ("The configured output cap may have been reached, or the model/context "
+                            "hit another generation boundary. Shorten the prompt/reasoning or adjust "
+                            "the output limit if needed; do not retry unchanged.")
+            raise ModelOutputExhausted("Ollama ended generation with done_reason=length at "
+                                       f"num_predict={self.config.num_predict}." + metrics +
+                                       " No action was executed. " + guidance)
         try:
             decision = parse_decision(result["message"]["content"], self.config.task_checklist, review_click)
         except (KeyError, TypeError) as exc:

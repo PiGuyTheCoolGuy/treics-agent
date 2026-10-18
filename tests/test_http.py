@@ -605,9 +605,21 @@ class HTTPTests(unittest.TestCase):
         # Even valid-looking JSON must not be dispatched after Ollama reports truncation.
         self.upstream.decision = decision("write_file", {"path": "must-not-run.txt", "content": "partial output"})
         self.upstream.reply_overrides = {"done_reason": "length"}
-        with self.assertRaisesRegex(ModelError, f"num_predict={cfg.num_predict}.*No action was executed"):
+        with self.assertRaisesRegex(ModelError, f"done_reason=length.*num_predict={cfg.num_predict}.*No action was executed"):
             client.decide("Write the file", "", "", [], None, threading.Event())
         self.assertFalse((cfg.work_path / "must-not-run.txt").exists())
+
+    def test_unlimited_length_reports_real_cause_and_ollama_counts(self):
+        self.configure_models()
+        cfg = dataclasses.replace(self.cfg, num_predict=-1)
+        self.upstream.reply_overrides = {
+            "done_reason": "length", "eval_count": 4096, "prompt_eval_count": 8000}
+        with self.assertRaisesRegex(ModelError, "Output tokens are already unlimited") as caught:
+            ModelClient(cfg).decide("Small action", "", "", [], None, threading.Event(),
+                                    on_chunk=lambda fragment: None)
+        self.assertIn("4096 tokens", str(caught.exception))
+        self.assertIn("8000 tokens", str(caught.exception))
+        self.assertIs(self.upstream.payloads[-1]["options"]["num_predict"], -1)
 
     def test_checklist_mode_adds_plan_schema_and_evidence_context_only_when_enabled(self):
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,

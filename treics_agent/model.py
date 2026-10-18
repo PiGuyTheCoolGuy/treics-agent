@@ -432,7 +432,7 @@ class ModelClient:
 
     def request(self, method: str, path: str, payload: dict | None = None,
                 stop: threading.Event | None = None, timeout: float | None = None,
-                on_chunk=None) -> dict:
+                on_chunk=None, on_thinking=None) -> dict:
         url = urlsplit(self.config.ollama_url)
         cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
         conn = cls(url.hostname, url.port, timeout=min(10, timeout) if timeout is not None else 10)
@@ -454,7 +454,12 @@ class ModelClient:
             conn.request(method, path, body=json.dumps(payload) if payload is not None else None,
                          headers=headers)
             response = conn.getresponse()
-            if on_chunk is not None and response.status == 200:
+            if (on_chunk is not None or on_thinking is not None) and response.status == 200:
+                content_type = response.getheader("Content-Type", "")
+                if "application/json" in content_type and "ndjson" not in content_type:
+                    raise ModelError("The model gateway returned a buffered JSON response instead of a stream. "
+                                     "Update and restart the host treic-model-proxy service.")
+
                 # Ollama streams newline-delimited JSON, not one JSON document.
                 parts = []
                 total = 0
@@ -477,12 +482,18 @@ class ModelClient:
                         raise ModelError(str(item["error"]))
                     message = item.get("message") or {}
                     if isinstance(message, dict):
+                        thinking = message.get("thinking", "")
+                        if thinking and on_thinking:
+                            if not isinstance(thinking, str):
+                                raise ModelError("Invalid model thinking chunk.")
+                            on_thinking(thinking)
                         fragment = message.get("content", "")
                         if not isinstance(fragment, str):
                             raise ModelError("Invalid model output chunk.")
                         if fragment:
                             parts.append(fragment)
-                            on_chunk(fragment)
+                            if on_chunk:
+                                on_chunk(fragment)
                     if item.get("done"):
                         final = item
                         break
@@ -546,7 +557,7 @@ class ModelClient:
                screen: dict | None, stop: threading.Event,
                budget: dict | None = None, filesystem: dict | None = None,
                checklist: list[dict] | None = None, recovery: dict | None = None,
-               click_review_image: str | None = None, on_chunk=None) -> tuple[dict, dict]:
+               click_review_image: str | None = None, on_chunk=None, on_thinking=None) -> tuple[dict, dict]:
         tools = "\n".join(f"{name}: {description}" for name, description in TOOLS.items()
                           if self.config.task_checklist or name != "set_checklist")
         prompt = SYSTEM_PROMPT + (CHECKLIST_PROMPT if self.config.task_checklist else "")
@@ -606,13 +617,14 @@ class ModelClient:
                 {"role": "system", "content": prompt + "\nTools:\n" + tools +
                  response_shape}, *messages, user],
             "format": decision_schema(screen, self.config.task_checklist,
-                                      self.config.task_checklist and not checklist, review_click, space), "stream": on_chunk is not None,
+                                      self.config.task_checklist and not checklist, review_click, space), "stream": on_chunk is not None or on_thinking is not None,
             "think": False,
             "keep_alive": self.config.keep_alive,
             "options": {"temperature": 0.1, "num_ctx": self.config.num_ctx,
                         "num_thread": self.config.num_thread, "num_predict": self.config.num_predict},
         }
-        result = (self.request("POST", "/api/chat", payload, stop, on_chunk=on_chunk) if on_chunk
+        result = (self.request("POST", "/api/chat", payload, stop, on_chunk=on_chunk,
+                               on_thinking=on_thinking) if payload["stream"]
                   else self.request("POST", "/api/chat", payload, stop))
         if result.get("done_reason") == "length":
             raise ModelError(f"Model reached num_predict={self.config.num_predict} before completing its response. "

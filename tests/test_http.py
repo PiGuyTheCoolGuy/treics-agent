@@ -92,6 +92,8 @@ class FakeOllama(BaseHTTPRequestHandler):
             for index, piece in enumerate(pieces):
                 data = {"message": {"role": "assistant", "content": piece},
                         "done": index == len(pieces) - 1}
+                if index == 0 and self.server.thinking:
+                    data["message"]["thinking"] = self.server.thinking
                 if data["done"]:
                     data.update({"eval_count": 20, **self.server.reply_overrides})
                 try:
@@ -118,6 +120,7 @@ class HTTPTests(unittest.TestCase):
         self.upstream.daemon_threads = True
         self.upstream.payloads = []
         self.upstream.reply_overrides = {}
+        self.upstream.thinking = ""
         self.upstream.block = False
         self.upstream.block_paths = None
         self.upstream.capabilities = {}
@@ -191,6 +194,14 @@ class HTTPTests(unittest.TestCase):
             state = json.loads(response.readline()[6:])
             self.assertEqual(state["text"], "partial response")
             self.assertEqual(state["step"], 2)
+            self.assertEqual(state["chunks"], 1)
+            self.assertIsNotNone(state["first_token_at"])
+            self.assertIsNotNone(state["last_token_at"])
+            self.agent.update_model_output("a" * 32, 2, "thinking", thinking="checking")
+            response.readline()
+            thinking_state = json.loads(response.readline()[6:])
+            self.assertEqual(thinking_state["thinking"], "checking")
+            self.assertEqual(thinking_state["thinking_chunks"], 1)
         finally:
             connection.close()
 
@@ -204,6 +215,18 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual("".join(chunks), json.dumps(self.upstream.decision))
         self.assertEqual(metrics["eval_count"], 20)
         self.assertIs(self.upstream.payloads[-1]["stream"], True)
+
+    def test_model_stream_thinking_is_reported_without_corrupting_structured_output(self):
+        self.configure_models()
+        self.upstream.thinking = "Model-provided analysis text."
+        text_chunks, thinking_chunks = [], []
+        decision_result, metrics = ModelClient(self.cfg).decide(
+            "Stream decision", "", "", [], None, threading.Event(),
+            on_chunk=text_chunks.append, on_thinking=thinking_chunks.append)
+        self.assertEqual(decision_result["action"], "finish")
+        self.assertEqual("".join(text_chunks), json.dumps(self.upstream.decision))
+        self.assertEqual(thinking_chunks, ["Model-provided analysis text."])
+        self.assertEqual(metrics["eval_count"], 20)
 
     def configure_models(self):
         self.cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,

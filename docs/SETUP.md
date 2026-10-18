@@ -150,7 +150,18 @@ Then update and restart the **guest controller** from the host:
 bash scripts/ssh-vm.sh 'cd ~/treics-agent && git pull --ff-only && bash scripts/install-guest.sh --skip-apt && systemctl --user restart treics-agent'
 ```
 
-Refresh the dashboard and start a new task. Its live output pane should show incremental response text for the selected run, switching to **complete** after Ollama returns the final message and the agent validates the decision. Your task history and Stop/Pause controls remain independent of the streaming connection. The panel shows only model output provided by Ollama, not hidden reasoning. Unlike the desktop preview, this stream contains text, so treat the dashboard token as sensitive.
+Refresh the dashboard and start a new task. Its live output pane should show incremental response text for the selected run, switching to **complete** after Ollama returns the final message and the agent validates the decision. The status also distinguishes **Waiting for first token**, **Model-provided thinking** (only if Ollama emits a thinking field), and **Receiving text**. It shows elapsed time, chunk counts, and the last received chunk age. The first-token wait includes model loading, screenshot processing and prompt evaluation; Ollama does not stream progress for those phases. The agent still requests `think: false`, so a separate thinking field is generally not expected.
+
+If the panel stays at **Waiting for first token**, first verify that the host's installed gateway is the current file:
+
+```bash
+cd ~/treics-agent
+sha256sum scripts/model-proxy.py /opt/treics-agent-host/model-proxy.py
+sudo systemctl status treic-model-proxy --no-pager
+bash scripts/ssh-vm.sh 'systemctl --user status treics-agent --no-pager; cd ~/treics-agent && git rev-parse --short HEAD'
+```
+
+The two hashes should match. If not, reinstall and restart the host gateway as shown above. A non-streaming gateway now produces an explicit error rather than pretending to stream. For large CPU-hosted vision models, a long first-token delay can still be legitimate even when streaming is working correctly. Your task history and Stop/Pause controls remain independent of the streaming connection. The panel shows only model output provided by Ollama, not hidden reasoning. Unlike the desktop preview, this stream contains text, so treat the dashboard token as sensitive.
 
 ## 5. Stop, restart, update, and keep a baseline
 

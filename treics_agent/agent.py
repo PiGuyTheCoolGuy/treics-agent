@@ -43,7 +43,9 @@ class Agent:
         self.last_model_seconds: float | None = None
         self.phase_started = time.time()
         self.model_output = {"run_id": None, "step": 0, "status": "idle",
-                             "text": "", "sequence": 0}
+                             "text": "", "thinking": "", "sequence": 0,
+                             "started_at": None, "first_token_at": None,
+                             "last_token_at": None, "chunks": 0, "thinking_chunks": 0}
         self.store.recover()
 
     def set_phase(self, phase: str) -> None:
@@ -51,15 +53,31 @@ class Agent:
             self.phase = phase
             self.phase_started = time.time()
 
-    def update_model_output(self, run_id: str, step: int, status: str, chunk: str = "") -> None:
-        # The running inference thread owns this state; dashboards subscribe without
-        # influencing model execution. Only the latest response is retained in memory.
+    def update_model_output(self, run_id: str, step: int, status: str, chunk: str = "",
+                            thinking: str = "", error: str = "") -> None:
+        # Keep the most recent inference visible without persisting partial sensitive text.
+        now = time.time()
         with self.condition:
             if self.model_output["run_id"] != run_id or self.model_output["step"] != step:
-                self.model_output = {"run_id": run_id, "step": step, "status": status,
-                                     "text": "", "sequence": self.model_output["sequence"] + 1}
-            if chunk:
-                self.model_output["text"] = (self.model_output["text"] + chunk)[-100000:]
+                self.model_output = {
+                    "run_id": run_id, "step": step, "status": status,
+                    "text": "", "thinking": "", "sequence": self.model_output["sequence"] + 1,
+                    "started_at": now if status == "generating" else None,
+                    "first_token_at": None, "last_token_at": None,
+                    "chunks": 0, "thinking_chunks": 0,
+                }
+            if chunk or thinking:
+                if self.model_output["first_token_at"] is None:
+                    self.model_output["first_token_at"] = now
+                self.model_output["last_token_at"] = now
+                if chunk:
+                    self.model_output["text"] = (self.model_output["text"] + chunk)[-100000:]
+                    self.model_output["chunks"] += 1
+                if thinking:
+                    self.model_output["thinking"] = (self.model_output["thinking"] + thinking)[-40000:]
+                    self.model_output["thinking_chunks"] += 1
+            if error:
+                self.model_output["error"] = error[:500]
             self.model_output["status"] = status
             self.model_output["sequence"] += 1
             self.condition.notify_all()
@@ -303,7 +321,8 @@ class Agent:
                                 "steps_remaining": run["max_steps"] - step + 1},
                         filesystem=self.tools.filesystem_context(recovery.path_events() + context_events),
                         recovery=recovery_context, **checklist_context, **review_context,
-                        on_chunk=lambda chunk: self.update_model_output(run_id, step, "generating", chunk))
+                        on_chunk=lambda chunk: self.update_model_output(run_id, step, "streaming", chunk),
+                        on_thinking=lambda chunk: self.update_model_output(run_id, step, "thinking", thinking=chunk))
                     self.update_model_output(run_id, step, "complete")
                     with self.lock:
                         self.last_model_seconds = time.monotonic() - started
@@ -389,6 +408,8 @@ class Agent:
                         raise Cancelled() from exc
                     errors += 1
                     message = str(exc)[:2000]
+                    if self.model_output_snapshot()["status"] in {"generating", "streaming", "thinking"}:
+                        self.update_model_output(run_id, step, "error", error=message)
                     error_data = {"message": message, "recovery_context": recovery_context}
                     if decision:
                         error_data["decision"] = decision
@@ -434,7 +455,7 @@ class Agent:
                 self.store.update(run_id, status="failed", summary=str(exc)[:2000])
         finally:
             with self.condition:
-                if self.model_output["run_id"] == run_id and self.model_output["status"] == "generating":
+                if self.model_output["run_id"] == run_id and self.model_output["status"] in {"generating", "streaming", "thinking"}:
                     self.model_output["status"] = "interrupted"
                     self.model_output["sequence"] += 1
                     self.condition.notify_all()

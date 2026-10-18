@@ -117,7 +117,7 @@ bash scripts/ssh-vm.sh 'cd ~/treics-agent && .venv/bin/treics-agent output-token
 
 To remove the output-token cap instead, replace `8192` with `-1`. This changes only the guest's saved `num_predict` setting, not Ollama's context window or the gateway service. Update the **host** `/opt/treics-agent-host/model-proxy.py` before enabling either expanded setting: `sudo install -m 644 scripts/model-proxy.py /opt/treics-agent-host/model-proxy.py && sudo systemctl restart treic-model-proxy`. When changing configuration, always finish or stop the current run before restarting services. Models that cannot disable thinking may still spend tokens on reasoning.
 
-The gateway limits context to 16,384 tokens, output to 4,096 tokens, threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
+The gateway limits context to 16,384 tokens, output to 32,768 tokens (or -1 for unlimited generation), threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
 
 ### Optional task checklist experiment
 

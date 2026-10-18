@@ -69,7 +69,7 @@ class FakeModel:
         self.click_review_images = []
 
     def decide(self, task, state, memory, events, screen, stop, budget=None, filesystem=None, checklist=None, recovery=None,
-               click_review_image=None, on_chunk=None):
+               click_review_image=None, on_chunk=None, on_thinking=None):
         self.screens.append(screen)
         self.budgets.append(budget)
         self.events.append(events)

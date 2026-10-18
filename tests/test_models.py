@@ -7,11 +7,34 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from treics_agent.config import Config, initialize_config, load_config, set_model, set_stall_attempts
+from treics_agent.config import Config, initialize_config, load_config, set_model, set_stall_attempts, set_output_tokens
 from treics_agent.model import ModelClient, ModelError
 
 
 class ModelConfigTests(unittest.TestCase):
+    def test_output_token_defaults_unlimited_and_saved_migration(self):
+        self.assertEqual(Config().num_predict, 8192)
+        Config(num_predict=-1).validate()
+        Config(num_predict=32768).validate()
+        for invalid in (0, -2, 127, 32769, 8192.0, True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                Config(num_predict=invalid).validate()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            initialize_config(path)
+            self.assertEqual(load_config(path).num_predict, 8192)
+            path.write_text(path.read_text().replace("num_predict = 8192", "num_predict = 1600"))
+            self.assertEqual(load_config(path).num_predict, 1600)
+            set_output_tokens(-1, path)
+            self.assertEqual(load_config(path).num_predict, -1)
+            set_output_tokens(8192, path)
+            self.assertEqual(load_config(path).num_predict, 8192)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            for invalid in (0, -2, 32769, True):
+                with self.assertRaises(ValueError):
+                    set_output_tokens(invalid, path)
+            self.assertEqual(load_config(path).num_predict, 8192)
+
     def test_removed_click_guard_setting_does_not_break_an_existing_installation(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"

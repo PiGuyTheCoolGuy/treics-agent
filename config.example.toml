@@ -5,7 +5,8 @@ model = "qwen3-vl:30b-a3b-instruct"
 # 16 physical cores is a starting point on the dual E5-2660 v2; benchmark 12/16/20.
 num_thread = 16
 num_ctx = 8192
-num_predict = 1600
+# Maximum generated tokens per decision; -1 disables the token cap (use with caution).
+num_predict = 8192
 keep_alive = "30m"
 request_timeout = 1200
 

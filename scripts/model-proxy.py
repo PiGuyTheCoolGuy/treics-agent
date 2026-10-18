@@ -71,11 +71,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     raise ValueError("options must be an object")
                 options = {}
                 for name, default, low, high in (("num_ctx", 8192, 4096, 16384),
-                    ("num_predict", 1600, 1, 4096), ("num_thread", 16, 1, 20)):
+                    ("num_thread", 16, 1, 20)):
                     value = requested.get(name, default)
                     if type(value) is not int or not low <= value <= high:
                         raise ValueError(f"{name} must be an integer from {low} to {high}")
                     options[name] = value
+                output_limit = requested.get("num_predict", 8192)
+                if type(output_limit) is not int or (output_limit != -1 and not 1 <= output_limit <= 32768):
+                    raise ValueError("num_predict must be -1 (unlimited) or 1–32768")
+                options["num_predict"] = output_limit
                 temperature = requested.get("temperature", 0.1)
                 if type(temperature) not in (int, float) or not 0 <= temperature <= 2:
                     raise ValueError("temperature must be between 0 and 2")
@@ -133,7 +137,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if not line:
                         break
                     total += len(line)
-                    if total > 4 * 1024 * 1024:
+                    if total > 64 * 1024 * 1024:
                         break
                     self.wfile.write(line)
                     self.wfile.flush()

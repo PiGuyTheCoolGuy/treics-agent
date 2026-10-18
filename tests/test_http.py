@@ -544,6 +544,19 @@ class HTTPTests(unittest.TestCase):
         status, data = request(self.proxy, "/api/tags", token=self.proxy_token)
         self.assertEqual([x["name"] for x in json.loads(data)["models"]], [self.cfg.model])
 
+    def test_proxy_accepts_extended_and_unlimited_token_limits(self):
+        for limit in (8192, 32768, -1):
+            with self.subTest(limit=limit):
+                payload = {"model": self.cfg.model, "messages": [{"role": "user", "content": "Hi"}],
+                           "options": {"num_predict": limit}}
+                self.assertEqual(request(self.proxy, "/api/chat", "POST", payload, self.proxy_token)[0], 200)
+                self.assertEqual(self.upstream.payloads[-1]["options"]["num_predict"], limit)
+        for limit in (0, -2, 32769, "8192", True):
+            with self.subTest(invalid=limit):
+                payload = {"model": self.cfg.model, "messages": [{"role": "user", "content": "Hi"}],
+                           "options": {"num_predict": limit}}
+                self.assertEqual(request(self.proxy, "/api/chat", "POST", payload, self.proxy_token)[0], 400)
+
     def test_real_model_client_posts_latest_image_and_schema_through_proxy(self):
         cfg = dataclasses.replace(self.cfg, ollama_url="http://%s:%s" % self.proxy.server_address,
                                    ollama_token=self.proxy_token)
@@ -592,7 +605,7 @@ class HTTPTests(unittest.TestCase):
         # Even valid-looking JSON must not be dispatched after Ollama reports truncation.
         self.upstream.decision = decision("write_file", {"path": "must-not-run.txt", "content": "partial output"})
         self.upstream.reply_overrides = {"done_reason": "length"}
-        with self.assertRaisesRegex(ModelError, "num_predict=1600.*No action was executed"):
+        with self.assertRaisesRegex(ModelError, f"num_predict={cfg.num_predict}.*No action was executed"):
             client.decide("Write the file", "", "", [], None, threading.Event())
         self.assertFalse((cfg.work_path / "must-not-run.txt").exists())
 

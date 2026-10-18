@@ -107,7 +107,15 @@ Then click **Refresh models**, choose `qwen3-vl:8b`, and click **Use model**. Bo
 
 The `TREICS_AGENT_MODEL` environment variable overrides the configuration. Remove that override and restart the controller before selecting a different model in the dashboard. The selector uses short metadata requests through the existing authenticated gateway; discovery remains available during inference without interfering with Stop or the live desktop feed. The first task with a newly selected model may include its normal load time.
 
-Agent actions and the vision smoke test explicitly send `think: false` so models that support disabling reasoning can spend their output budget on the requested JSON. This does not disable image input. If a task still reaches its output limit, the controller rejects the truncated action and reports the configured `num_predict`. Keep reason/state and file-writing actions smaller, or raise `num_predict` in the guest config and restart. The default is 1,600; the current gateway accepts up to 4,096. Longer responses can take more time. Models that cannot disable thinking may still spend tokens on reasoning.
+Agent actions and the vision smoke test explicitly send `think: false` so models that support disabling reasoning can spend their output budget on the requested JSON. This does not disable image input. If a task still reaches its output limit, the controller rejects the truncated action and reports the configured `num_predict`. Keep reason/state and file-writing actions smaller, or raise `num_predict` in the guest config and restart. The new default for newly initialized configurations is **8,192** tokens; existing configurations retain their saved limit until changed. The gateway accepts up to **32,768** tokens or **-1** for unlimited generation. The safest normal setting on the CPU-only host is 8,192. Unlimited generation can enter a repetitive loop, and the existing inference timeout, context limit and stream-size safety cap still apply.
+
+To change the **existing VM** to 8,192 tokens from the host after updating the VM code:
+
+```bash
+bash scripts/ssh-vm.sh 'cd ~/treics-agent && .venv/bin/treics-agent output-tokens 8192 && systemctl --user restart treics-agent'
+```
+
+To remove the output-token cap instead, replace `8192` with `-1`. This changes only the guest's saved `num_predict` setting, not Ollama's context window or the gateway service. Update the **host** `/opt/treics-agent-host/model-proxy.py` before enabling either expanded setting: `sudo install -m 644 scripts/model-proxy.py /opt/treics-agent-host/model-proxy.py && sudo systemctl restart treic-model-proxy`. When changing configuration, always finish or stop the current run before restarting services. Models that cannot disable thinking may still spend tokens on reasoning.
 
 The gateway limits context to 16,384 tokens, output to 4,096 tokens, threads to 20, and concurrent requests to one. Larger configuration values require adjusting those gateway limits too. Longer task budgets are set with `max_steps` and `max_run_minutes`; pause time counts against the elapsed-time budget. A model call can run until its request timeout, but no next action executes after the elapsed budget has expired.
 

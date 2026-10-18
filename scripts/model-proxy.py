@@ -137,7 +137,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if not line:
                         break
                     total += len(line)
-                    if total > 4 * 1024 * 1024:
+                    if total > 64 * 1024 * 1024:
                         break
                     self.wfile.write(line)
                     self.wfile.flush()
